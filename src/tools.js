@@ -1,0 +1,1468 @@
+// Bo tool MCP: Claude Code (Leader/PM) dieu phoi Antigravity (Engineer) theo dung quy trinh.
+import fs from 'node:fs';
+import path from 'node:path';
+import { loadConfig, existingRulesFiles, CONFIG_NAME, withGateSnapshot } from './config.js';
+import {
+  createTask, loadTask, listTasks, save, updateTask, setPhase, recordVerdict, recordRun, recordProof,
+  recordDispatch, markRework, accept, gate, freshness, contractPaths, addHistory, PHASES, TASK_TYPES,
+  discardProofs, anhTrung, hashFile, ackWarning, locCanhBaoDaXem, ghiMocGiao, chupThemCam, headCommitOf } from './tasks.js';
+import {
+  newConversation, sendMessage, getConversationMetadata, conversationProgress, transcriptErrors, MODELS, isAgyModel, agyPath, agyTurnStatus, agyTurnStatusSafe, agyRegistryProblem, agyPermissionPolicy,
+  sameProcess, reapTurnLeftovers, agyTurnEndReason,
+} from './agentapi.js';
+import { tuLamTiepSauWatchdog, lyDoDeDoc } from './auto-continue.js';
+import { discover, agentapiPath } from './discover.js';
+import { requireProjectId, resolveProject } from './projects.js';
+import {
+  buildPlanCritiquePrompt, buildImplementMessage, buildReworkMessage, buildAuditPrompt,
+  buildProofRequestMessage, buildNudgeMessage, planTemplate, kiemTraKeHoach, buildPlanReviewFixMessage,
+} from './prompt.js';
+import { captureProof, describeProviders, adbReadinessLines } from './proof.js';
+import { renderReport } from './report.js';
+import {
+  mustHaveOf, fileRacGocRepo, cungFile, kiemChongLan, PROOF_KINDS, kiemKhuonPlanReview,
+} from './policy.js';
+import { collectTestEvidence, evidenceLine } from './evidence.js';
+import { replayOracle, oracleLine } from './oracle.js';
+import { kiemBaoCao, dongTomTat } from './cite-check.js';
+import { soiThayDoi } from './lint-diff.js';
+import { gitSnapshot, changedFilesOf, baseCommitOf, gateCtx, dongBangCay, goWorktree, thuMucTrangThai } from './worktree.js';
+import { hashOf, deltaKeHoach, tinhTrangPhanBien, projectIdFor } from './plan-review.js';
+import { cacTaskDangChayKhac, canhBaoTruocKhiGiao } from './dispatch-guard.js';
+import { run, runShell, writeFileAtomic, ensureDir, exists, tail, truncate, nowIso, readJsonIfExists, killGroup, logStderr } from './util.js';
+
+// ---------------------------------------------------------------- kiem tra tham so
+
+function fail(msg) {
+  const e = new Error(msg);
+  e.userFacing = true;
+  throw e;
+}
+
+function validate(schema, args) {
+  const out = {};
+  const props = schema.properties || {};
+  for (const req of schema.required || []) {
+    if (args?.[req] === undefined || args?.[req] === null || args?.[req] === '') fail(`Thieu tham so bat buoc: "${req}"`);
+  }
+  for (const [k, v] of Object.entries(args || {})) {
+    const p = props[k];
+    if (!p) continue; // bo qua tham so la
+    if (p.type === 'string' && typeof v !== 'string') fail(`"${k}" phai la chuoi`);
+    if (p.type === 'number' && typeof v !== 'number') fail(`"${k}" phai la so`);
+    if (p.type === 'boolean' && typeof v !== 'boolean') fail(`"${k}" phai la true/false`);
+    if (p.type === 'array' && !Array.isArray(v)) fail(`"${k}" phai la danh sach`);
+    if (p.enum && !p.enum.includes(v)) fail(`"${k}" phai thuoc: ${p.enum.join(' | ')}`);
+    out[k] = v;
+  }
+  return out;
+}
+
+// Mo ta tool + schema duoc gui vao context CUA BEN DUNG MCP o MOI PHIEN => viet ngan nhat
+// co the ma van du nghia. Chi tiet dai de trong docs/tools-reference.md.
+const PROJECT_PROP = {
+  project: { type: 'string', description: 'Goc project (mac dinh: cwd)' },
+};
+const TASK_PROP = { taskId: { type: 'string', description: 'Ma task (T0001-...)' } };
+
+// ---------------------------------------------------------------- tro giup
+
+function ctx(args) {
+  const cfg = loadConfig(args?.project);
+  return cfg;
+}
+
+function withTask(args) {
+  const live = ctx(args);
+  const task = loadTask(live, args.taskId);
+  // Moi thao tac tren task dung BAN CHUP cau hinh cong luc tao task (agent sua .antigravity-pm.json khong co tac dung).
+  return { cfg: withGateSnapshot(live, task), task };
+}
+
+/** pathspec cua pm_diff -> argv ['--', ...]: chuoi tach theo khoang trang (nhu shell cu) hoac mang. */
+export function pathspecArgs(pathspec) {
+  const parts = (Array.isArray(pathspec) ? pathspec : String(pathspec ?? '').split(/\s+/))
+    .map((x) => String(x).trim()).filter(Boolean);
+  return parts.length ? ['--', ...parts] : [];
+}
+
+/** Tap ky tu strip CHUNG voi push_gate._AGENT_WS (vong kiem lai H3): hop cua trim() JS (co ﻿) va str.strip() Python (co \x1c-\x1f, \x85). */
+const AGENT_WS = '\\t\\n\\v\\f\\r \\x1c-\\x1f\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff';
+const AGENT_TRIM = new RegExp(`^[${AGENT_WS}]+|[${AGENT_WS}]+$`, 'g');
+const agentText = (x) => String(x || '').replace(AGENT_TRIM, '').toLowerCase();
+/** grok, grok-4.7, grok-build, "grok build", "grok:"... la Grok (khong khop "grokx", "grok4"). */
+const laGrok = (x) => /^grok(?![a-z0-9])/.test(agentText(x));
+/** Ten agent chuan hoa, khop push_gate.normalize_reviewer (H3): cung tap strip, grok theo laGrok, antigravity roi het chuoi hoac - _ . -> antigravity,
+ *  con lai chu thuong (ten khac chi so trong cung mot ben: toLowerCase o day, casefold o Python). */
+function normalizeAgent(x) {
+  const v = agentText(x);
+  if (laGrok(v)) return 'grok';
+  if (/^antigravity(?:$|[-_.])/.test(v)) return 'antigravity';
+  return v;
+}
+/**
+ * Danh tinh agent goi PM (dot 2 F2, mot gia tri; ban Python: push_gate.session_agent; tu duyet xet TAP: callerAgents): DEVKIT_AGENT_ID chuan hoa neu co; khong thi "grok" khi
+ * env co GROK_SESSION_ID / GROK_WORKSPACE_ROOT / GROK_HOOK_EVENT; khong thi "claude" khi CLAUDECODE=1 hoac CLAUDE_CODE_SESSION_ID;
+ * khong thi "" (khong biet).
+ */
+export function callerAgent(env = process.env) {
+  const id = normalizeAgent(env.DEVKIT_AGENT_ID);
+  if (id) return id;
+  if (['GROK_SESSION_ID', 'GROK_WORKSPACE_ROOT', 'GROK_HOOK_EVENT'].some((k) => env[k])) return 'grok';
+  if (env.CLAUDECODE === '1' || env.CLAUDE_CODE_SESSION_ID) return 'claude';
+  return '';
+}
+/**
+ * TAP danh tinh phien goi PM (vong kiem lai H4; ban Python: push_gate.session_agents): {DEVKIT_AGENT_ID chuan hoa} + {grok khi GROK_*}
+ * + {claude khi CLAUDECODE=1 / CLAUDE_CODE_SESSION_ID}, bo rong. DEVKIT_AGENT_ID=codex trong phien Grok van la grok: tu duyet xet ca tap.
+ */
+export function callerAgents(env = process.env) {
+  const out = new Set([normalizeAgent(env.DEVKIT_AGENT_ID)]);
+  if (['GROK_SESSION_ID', 'GROK_WORKSPACE_ROOT', 'GROK_HOOK_EVENT'].some((k) => env[k])) out.add('grok');
+  if (env.CLAUDECODE === '1' || env.CLAUDE_CODE_SESSION_ID) out.add('claude');
+  out.delete('');
+  return out;
+}
+
+/** Dong `git status --porcelain --untracked-files=no` cua projectRoot, bo thu muc trang thai PM (F5): { error } hoac { dirty: [...] }. */
+async function trackedChanges(cfg, root = cfg.projectRoot) {
+  const st = await run('git', ['status', '--porcelain', '-z', '--no-renames', '--untracked-files=no'], { cwd: root, timeoutMs: 60000, maxBytes: 16_000_000 });
+  if (st.spawnFailed || st.timedOut || st.code !== 0 || st.truncated) {
+    return { error: `exit ${st.code}${st.timedOut ? ', qua han' : ''}${st.truncated ? ', output bi cat' : ''}` };
+  }
+  const stateDir = thuMucTrangThai(cfg);
+  return { dirty: String(st.stdout).split('\0').filter((e) => e.length > 3 && !e.slice(3).startsWith(stateDir)) };
+}
+
+/**
+ * #909: file bi che khoi `git status` (sparse-checkout => tag S, skip-worktree => S, assume-unchanged => chu thuong trong `git ls-files -v`):
+ * auditor khong doc duoc file ngoai cone hoac ban sua chua commit bi giau, ma audit van PASS. { error } hoac { hidden: ['<tag> <path>', ...] }.
+ */
+async function hiddenEntries(root) {
+  const ls = await run('git', ['ls-files', '-v', '-z'], { cwd: root, timeoutMs: 60000, maxBytes: 64_000_000 });
+  if (ls.spawnFailed || ls.timedOut || ls.code !== 0 || ls.truncated) {
+    return { error: `git ls-files -v exit ${ls.code}${ls.timedOut ? ', qua han' : ''}${ls.truncated ? ', output bi cat' : ''}` };
+  }
+  const hidden = String(ls.stdout).split('\0').filter((e) => e.length > 2 && (e[0] === 'S' || /[a-z]/.test(e[0])));
+  return { hidden };
+}
+
+/**
+ * Pham vi audit (04/11; 13/11 dung cho audit Antigravity): merge-base(nhanh dich, head) — dung pham vi gate DevKit duyet test sua (post-fix-gate _approval_chain), vi
+ * gate nhan MOI test da co bi sua ma blob o head khop. Nhanh dich theo thu tu post-fix-gate task_trunk: origin/HEAD -> origin/{main,master,
+ * trunk} -> {main,master,trunk}. { base, trunk, edited: file da co o base bi sua/xoa } hoac { base: null } khi khong tinh duoc.
+ */
+async function auditRange(cfg, head) {
+  const git = (args) => run('git', args, { cwd: cfg.projectRoot, timeoutMs: 30000, maxBytes: 4_000_000 });
+  const ok = (r) => !r.spawnFailed && !r.timedOut && r.code === 0 && !r.truncated;
+  const sym = await git(['symbolic-ref', '-q', 'refs/remotes/origin/HEAD']);
+  const cands = [...(ok(sym) && String(sym.stdout).trim().startsWith('refs/remotes/origin/') ? [String(sym.stdout).trim()] : []),
+    ...['refs/remotes/origin/', 'refs/heads/'].flatMap((p) => ['main', 'master', 'trunk'].map((n) => p + n))];
+  for (const trunk of cands) {
+    if (!ok(await git(['rev-parse', '--verify', '-q', `${trunk}^{commit}`]))) continue;
+    const mb = await git(['merge-base', trunk, head]);
+    const base = ok(mb) ? String(mb.stdout).trim() : '';
+    if (!/^[0-9a-f]{40}$/.test(base)) continue;   // P3: nhanh nay khong co merge-base voi head -> thu nhanh dich ke tiep
+    // OCR vong 6: doi ten roi sua (R) -> ghi ca duong cu va duong MOI (gate bao test sua theo duong moi); R/C co 2 duong sau trang thai.
+    const ns = await git(['diff', '--name-status', '-M', '-z', base, head]);
+    if (!ok(ns)) return { base: null };
+    const parts = String(ns.stdout).split('\0');
+    const edited = [];
+    for (let i = 0; i + 1 < parts.length;) {
+      const st = parts[i];
+      if (/^[RC]/.test(st)) {
+        if (st[0] === 'R') edited.push(parts[i + 1], parts[i + 2]);
+        i += 3;
+      } else {
+        if (/^[MDT]/.test(st)) edited.push(parts[i + 1]);
+        i += 2;
+      }
+    }
+    return { base, trunk, edited };
+  }
+  return { base: null };
+}
+
+/**
+ * 13/11 (chu repo bo Grok): pham vi PR cho audit Antigravity — { head, base, edited } khi cay sach (tru thu muc PM), khong file bi che khoi
+ * git status, HEAD doc duoc, merge-base voi nhanh dich tinh duoc va edited <= 200 file; khong thi null. Ghi vao lan giao audit de gate DevKit
+ * (push_gate.audit_scope) tra thang bien ban; pm_verdict ghi ket luan vao chinh lan giao do.
+ */
+async function auditScopeOf(cfg) {
+  const st = await trackedChanges(cfg);
+  if (st.error || st.dirty.length) return null;
+  const hid = await hiddenEntries(cfg.projectRoot);
+  if (hid.error || hid.hidden.length) return null;
+  const head = headCommitOf(cfg.projectRoot);
+  if (!head) return null;
+  const range = await auditRange(cfg, head);
+  if (!range.base || range.edited.length > 200) return null;
+  return { head, base: range.base, edited: range.edited };
+}
+
+/** Cong chan kem bang chung do duoc tu git ngay luc goi. */
+async function gateNow(cfg, task) {
+  return gate(cfg, task, await gateCtx(cfg, task));
+}
+
+function gateLines(g) {
+  const head = g.ok
+    ? 'CONG NGHIEM THU: DAT (du bang chung).'
+    : `CONG NGHIEM THU: CHUA DAT. Con thieu:\n- ${g.missing.join('\n- ')}`;
+  const warn = (g.warnings || []).length ? `\nCANH BAO:\n- ${g.warnings.join('\n- ')}` : '';
+  return head + warn;
+}
+
+function taskLine(t) {
+  const flag = t.phase === 'ACCEPTED' ? 'OK ' : '   ';
+  return `${flag}${t.id} · ${t.phase}${t.round ? ` (vong ${t.round})` : ''} · ${t.title}`;
+}
+
+/**
+ * Model THAT cua mot hoi thoai cua task: model ghi o lan dispatch MO no (pm_dispatch model=... khong doi task.model).
+ * Task cu chua ghi model luc mo hoi thoai thi roi ve task.model.
+ */
+function conversationModel(task, conversationId) {
+  return (task.dispatches || []).find((d) => d.conversationId === conversationId && d.model)?.model || task.model;
+}
+
+/** agyTurnStatus cho tool DOC (pm_status): khong doc duoc dau van tay / so dang ky thi in mot dong, KHONG lam mat ca bao cao. */
+function safeAgyTurn(L, conversationId, model, quiet = false) {
+  const { status, error, registryBroken } = agyTurnStatusSafe(conversationId);
+  if (!error) return status;
+  // So dang ky doc duoc: loi la tu ps tren muc CO trong so => hoi thoai LA agy, bat ke model nao. Chi khi so hong moi phai doan theo
+  // model cua hoi thoai (conversationModel): hoi thoai IDE (bac flash/pro) thi so agy hong khong lien quan toi nudge cua no.
+  if (registryBroken && model && !isAgyModel(model)) return null;
+  if (!quiet) L.push(`Luot agy: KHONG biet (${error})`);
+  return { unknown: true };   // task agy: khong biet luot nao dang chay => nudge phai bo qua
+}
+
+/** Dong trang thai luot agy cua pm_status. end = agyTurnEndReason(tep dau ra cua luot): vi sao luot ket thuc (watchdog cua PM / loi / xong). */
+function agyTurnLine(t, end = null) {
+  if (!t.running && end?.watchdog) return `Luot agy: BI PM DUNG (watchdog: ${lyDoDeDoc(end.error)}) — chua co result.json moi thi agent chua kip bao cao`;
+  if (!t.running && end?.failed) return `Luot agy: KET THUC LOI (${end.finishedReason || end.status || end.error}) — chua co result.json thi pm_message de lam tiep`;
+  if (!t.running) return 'Luot agy: DA KET THUC (tien trinh agy da thoat) — chua co result.json thi luot da chet hoac xong ma khong ghi ket qua: pm_message de lam tiep';
+  if (t.starting) return 'Luot agy: dang khoi dong — im lang khi build/test dai khong phai la treo';
+  return `Luot agy: DANG CHAY (pid ${t.pid}) — im lang khi build/test dai khong phai la treo`;
+}
+
+/** Ghi chu khi hoi thoai im lau qua stallMinutes. */
+function agyStallNote(t) {
+  if (!t) return ' — CO THE DANG TREO hoac dang doi ban bam Accept trong Antigravity';
+  if (!t.running) return '';
+  if (t.starting) return ' — PM dang mo luot moi (agy dang khoi dong)';
+  return ` — agy van chay (pid ${t.pid}); chi kill -- -${t.pid} neu qua lau va that su khong co dong tinh`;
+}
+
+/** Loi cua agy ma mot lan nhac khong the vao duoc: dang co luot chay / dang mo luot. Loi khac (mat agy, chinh sach quyen...) la loi that. */
+const isTurnBusy = (e) => e?.code === 'AGY_TURN_BUSY';
+
+/** Model agy khong can project id cua IDE (workspace = cwd): project chua tung mo trong IDE van giao duoc; bac agentapi van bat buoc. */
+function projectIdForModel(cfg, model) {
+  return isAgyModel(model) ? { id: null, name: '(agy)' } : requireProjectId(cfg);
+}
+
+async function ensureWorkspaceMatches(cfg, conversationId) {
+  const md = await getConversationMetadata(conversationId);
+  const want = fs.realpathSync(cfg.projectRoot);
+  const got = md.workspace ? (exists(md.workspace) ? fs.realpathSync(md.workspace) : md.workspace) : null;
+  const ok = got === want;
+  return { ok, md, want, got };
+}
+
+function saveOutgoing(cfg, task, name, text) {
+  const p = contractPaths(cfg, task);
+  const file = path.join(ensureDir(p.logsDir), `${name}.md`);
+  writeFileAtomic(file, text);
+  return file;
+}
+
+/**
+ * pm_run kind=oracle: PM tu tai hien loi tren code goc (worktree @ baseCommit + file test cua agent) roi
+ * chay lai tren cay that. Ghi run record kind='oracle' — cong nghiem thu (mustHave.oracle) doc tu day.
+ */
+async function runOracle(cfg, task, args) {
+  const fresh = freshness(cfg, task);
+  // Lenh oracle do PM truyen (hoac cau hinh) — KHONG lay tu result.json cua agent: PM se CHAY no voi quyen cua PM.
+  const command = args.command || cfg.oracle?.command || null;
+  if (!command && fresh.result?.oracle?.command) {
+    fail(`pm_run kind=oracle can "command" do PM truyen. Agent de xuat: ${JSON.stringify(fresh.result.oracle.command)} — doc ky roi truyen lai neu dong y.`);
+  }
+  const changedFiles = await changedFilesOf(cfg, task);
+  const base = await baseCommitOf(cfg, task);
+  const startedMs = Date.now();
+  const o = await replayOracle(cfg, {
+    baseCommit: base, command, changedFiles, timeoutMs: args.timeoutMs || cfg.runTimeoutMs,
+  });
+  const p = contractPaths(cfg, task);
+  const stamp = Date.now();
+  const logFile = path.join(ensureDir(p.logsDir), `oracle-r${task.round}-${stamp}.log`);
+  writeFileAtomic(logFile, [
+    `oracle: ${command || '(khong co lenh)'}`, `baseCommit: ${base || '(khong co)'}`, `blocked: ${o.blocked || '-'}`,
+    `testFilesCopied: ${o.testFilesCopied?.join(', ') || '-'}`, `extraCopied: ${o.extraCopied?.join(', ') || '-'}`,
+    '', '=== RED (worktree @ baseCommit) ===', o.redLog || '(chua chay)', '', '=== GREEN (cay that) ===', o.greenLog || '(chua chay)', '',
+  ].join('\n'));
+  const { redLog, greenLog, ...rec } = o;
+  recordRun(cfg, task, {
+    kind: 'oracle', command: command || '(khong co)', exitCode: o.ok ? 0 : 1, durationMs: Date.now() - startedMs,
+    timedOut: Boolean(o.red?.timedOut || o.green?.timedOut), logFile, startedAt: new Date(startedMs).toISOString(), oracle: rec,
+  });
+  const L = [`$ (oracle) ${command || '(khong co lenh)'}`, oracleLine(o)];
+  if (o.testFilesCopied?.length) L.push(`File test chep sang code goc: ${o.testFilesCopied.join(', ')}${o.extraCopied?.length ? ` (+ ${o.extraCopied.join(', ')})` : ''}`);
+  L.push(`Log: ${logFile}`);
+  if (o.blocked) L.push('Khong chay duoc oracle => ghi BLOCKED cho task, khong phai "agent sai". Xem ly do tren.');
+  L.push('');
+  L.push(gateLines(await gateNow(cfg, task)));
+  return L.join('\n');
+}
+
+// ---------------------------------------------------------------- dinh nghia tool
+
+export const TOOLS = [
+  {
+    name: 'pm_doctor',
+    description: 'Kiem tra Antigravity + cau hinh project. ping=true: mo hoi thoai thu de kiem chung duong day.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ping: { type: 'boolean', description: 'Mo hoi thoai thu (ton quota)' },
+      },
+    },
+    async handler(args) {
+      const cfg = ctx(args);
+      const L = [];
+      L.push(`Project: ${cfg.projectRoot}`);
+      L.push(`Cau hinh chung: ${cfg.globalConfigFile || '(chua co ~/.antigravity-pm.json)'}`);
+      L.push(`Cau hinh project: ${cfg.configFile
+        || `(chua co ${CONFIG_NAME} — dang dung ${cfg.globalConfigFile ? 'cau hinh chung' : 'mac dinh'})`}`);
+      for (const w of cfg.warnings) L.push(`  ! ${w}`);
+      L.push(`Thu muc trang thai: ${cfg.stateRoot} (file hop dong cua agent) · task.json cua PM: ${cfg.pmTasksRoot}`);
+      L.push(`Model mac dinh: ${cfg.defaultModel}`);
+      L.push(`Lenh test: ${cfg.testCommand || '(CHUA KHAI — pm_run kind=test se bao loi, cong nghiem thu se khong bao gio dat)'}`);
+      L.push(`Lenh audit: ${cfg.auditCommands.length ? cfg.auditCommands.join(' ; ') : '(chua khai)'}`);
+      L.push(`File luat se nhet vao prompt: ${existingRulesFiles(cfg).join(', ') || '(khong thay file nao)'}`);
+      const provs = describeProviders(cfg);
+      L.push(`Cach chup anh nghiem thu: ${provs.length ? provs.map((p) => `${p.name}(${p.type}${p.detail ? ` ${p.detail}` : ''})`).join(', ') : '(chua khai — van co the dung sourceFile de nhan anh do agent tu chup)'}`);
+      try {
+        for (const line of await adbReadinessLines(cfg)) L.push(line);
+      } catch (e) {
+        L.push(`adb: khong kiem tra duoc — ${e.message}`);
+      }
+      L.push(`So anh toi thieu de nghiem thu: ${cfg.proof.require}`);
+      const must = mustHaveOf(cfg);
+      L.push(`LUAT BAT BUOC — thay doi phai kem file test: ${must.testChange ? 'CO' : 'tat'}`
+        + ` · anh phai chup tu: ${must.proofFrom.length ? must.proofFrom.join(' hoac ') : '(bat ky provider nao)'}`);
+      L.push(`  · file rac goc repo: ${must.strayFiles} · stage test: ${Object.keys(cfg.testStages || {}).join(', ') || '(khong)'} · tran plan trong prompt: ${cfg.promptPlanMaxBytes} ky tu`);
+      L.push(`  · oracle do->xanh PM tu replay: ${must.oracle ? 'CO (task bugfix)' : 'tat'}`
+        + ` · thu muc doc quyen (khong giao song song): ${must.exclusiveDirs.length ? must.exclusiveDirs.join(', ') : '(khong)'}`);
+      const globs = cfg.testEvidence?.resultsGlob || [];
+      L.push(`  · bang chung test: ${globs.length ? `XML JUnit ${globs.join(', ')}` : 'CHI stdout (weak) — khai testEvidence.resultsGlob de dem tu XML'}`
+        + ` · file chep vao worktree oracle: ${(cfg.oracle?.copyToWorktree || []).join(', ') || '(khong)'}`);
+      L.push('');
+      L.push(`agentapi: ${agentapiPath() || 'KHONG TIM THAY'}`);
+      // agy in CA KHI model mac dinh la bac IDE: task van chay qua agy khi pm_task_create / pm_dispatch chon model cu the,
+      // va doctor phai giai thich duoc vi sao dispatch do loi (OpenCodeReview 14/10)
+      const ap = agyPermissionPolicy(cfg.projectRoot);
+      L.push(`agy: ${agyPath() || 'KHONG TIM THAY'} · model mac dinh ${cfg.defaultModel}${isAgyModel(cfg.defaultModel) ? '' : ' (bac IDE: agy chi chay khi task / pm_dispatch chon model cu the)'}`);
+      const regProblem = agyRegistryProblem();
+      if (regProblem) L.push(`  SO DANG KY AGY HONG: ${regProblem}`);
+      L.push(`  agy --dangerously-skip-permissions: ${ap.ok ? 'DUOC' : 'KHONG DUOC — dispatch qua agy bi tu choi'} (chinh sach tu chay lenh: ${ap.policy || 'chua dat'} · ${ap.from})`);
+      const proj = resolveProject(cfg.projectRoot);
+      if (proj) {
+        L.push(`Project trong Antigravity: ${proj.name} · id ${proj.id}${proj.match === 'parent' ? ' (khop qua thu muc cha)' : ''}`);
+        const eager = /EAGER|TURBO/i.test(`${proj.autoExecution} ${proj.artifactReview}`);
+        L.push(`  Tu chay lenh: ${proj.autoExecution || '?'} · duyet artifact: ${proj.artifactReview || '?'}`
+          + (eager ? ' => agent tu chay, khong ket o man hinh cho bam Accept' : ' => agent CO THE dung cho ban bam Accept trong IDE'));
+      } else if (cfg.antigravity.projectId) {
+        L.push(`Project id: ${cfg.antigravity.projectId} (khai trong cau hinh)`);
+      } else {
+        L.push('Project trong Antigravity: CHUA DANG KY — pm_dispatch se that bai. Mo project nay trong Antigravity 1 lan.');
+      }
+      try {
+        const conn = await discover();
+        L.push(`Antigravity language server: noi duoc tai ${conn.address} (nguon: ${conn.source})`);
+      } catch (e) {
+        L.push(`Antigravity language server: KHONG NOI DUOC — ${e.message}`);
+        if (e.hint) L.push(`  Goi y: ${e.hint}`);
+      }
+      const tasks = listTasks(cfg);
+      L.push('');
+      L.push(`Task hien co: ${tasks.length}`);
+      for (const t of tasks.slice(-8)) L.push(`  ${taskLine(t)}`);
+      L.push('');
+      L.push('Workspace duoc chon bang PROJECT ID (lay tu so dang ky ~/.gemini/config/projects), khong phai bang project ma IDE dang mo.');
+      L.push('Project phai tung duoc mo trong Antigravity 1 lan de duoc dang ky. pm_dispatch van kiem lai workspace sau khi tao, coi nhu luoi an toan.');
+
+      if (args?.ping) {
+        L.push('');
+        L.push('--- ping: mo 1 hoi thoai thu ---');
+        try {
+          const pid = requireProjectId(cfg);
+          L.push(`Dung project id: ${pid.id} (${pid.name})`);
+          const { conversationId } = await newConversation({
+            projectId: pid.id,
+            model: 'flash_lite',
+            title: '[PM] ping duong day',
+            prompt: 'Day la phep thu duong day tu Claude Code. Tra loi dung 1 tu: PONG. '
+              + 'KHONG goi bat ky tool nao, KHONG doc file, KHONG sua file, KHONG chay lenh.',
+          });
+          L.push(`Tao hoi thoai: OK — ${conversationId}`);
+          const md = await getConversationMetadata(conversationId);
+          L.push(`Workspace cua hoi thoai: ${md.workspace || '(khong ro)'}${md.branch ? ` · nhanh ${md.branch}` : ''}`);
+          L.push(`Khop voi project dang hoi: ${md.workspace && exists(md.workspace) && fs.realpathSync(md.workspace) === fs.realpathSync(cfg.projectRoot) ? 'CO' : 'KHONG — hay mo dung project trong Antigravity'}`);
+          await sendMessage({ conversationId, projectId: pid.id, content: 'Phep thu tin nhan tiep theo. Tra loi dung 1 tu: PONG2. Khong dung tool.', kind: 'custom' });
+          L.push('Gui tin nhan tiep vao hoi thoai cu: OK');
+          const prog = conversationProgress(conversationId);
+          L.push(`Dong tinh ghi nhan duoc: ${prog.found ? prog.lastActivityAt : 'chua thay (agent co the chua chay)'}`);
+          L.push('Ban co the mo Antigravity de xem 2 cau tra loi PONG/PONG2 — do la bang chung duong day thong ca 2 chieu.');
+        } catch (e) {
+          L.push(`PING THAT BAI: ${e.message}`);
+          if (e.hint) L.push(`  Goi y: ${e.hint}`);
+          if (e.detail) L.push(`  Chi tiet: ${truncate(String(e.detail), 1200)}`);
+        }
+        if (isAgyModel(cfg.defaultModel)) {
+          // Model cu the di qua agy, khong qua agentapi: kiem rieng duong do, vong doi day du (mo -> chay het luot -> gui tiep -> chay het luot).
+          L.push('');
+          L.push(`--- ping agy: model ${cfg.defaultModel} (mo MOT luot agy that trong ${cfg.projectRoot}, roi gui them mot tin) ---`);
+          const waitTurn = async (id, label) => {
+            const t0 = Date.now();
+            let t = agyTurnStatus(id);
+            if (!t) { L.push(`${label}: hoi thoai ${id} KHONG co trong so dang ky agy`); return false; }
+            const limit = Number(process.env.ANTIGRAVITY_PM_PING_WAIT_MS) || 90000;
+            while (t.running && Date.now() - t0 < limit) { await new Promise((r) => setTimeout(r, Math.min(1000, limit))); t = agyTurnStatus(id); }
+            L.push(`${label}: ${t.running ? `CHUA XONG sau ${Math.round(limit / 1000)} s` : 'xong'} (${Math.round((Date.now() - t0) / 1000)} s)`);
+            return !t.running;
+          };
+          let created = null;   // ngoai try: khuc finally duoi dung agy cua ping DU loi o buoc nao (ps hong, so dang ky hong...)
+          // pid -> dau van tay (ps lstart) agy cua CA HAI luot (luot 2 la tien trinh agy khac; so dang ky chi giu luot cuoi nen giu o day)
+          const pingTurns = new Map();
+          try {
+            created = await newConversation({
+              model: cfg.defaultModel, cwd: cfg.projectRoot, title: '[PM] ping agy',
+              prompt: 'Day la phep thu duong day tu Claude Code. Tra loi dung 1 tu: PONG. KHONG goi tool, KHONG doc file, KHONG sua file, KHONG chay lenh.',
+            });
+            const { conversationId } = created;
+            pingTurns.set(created.parsed?.pid, created.parsed?.pidTag);
+            L.push(`Mo hoi thoai agy: OK — ${conversationId}`);
+            const md = await getConversationMetadata(conversationId);
+            L.push(`Workspace: ${md.workspace} · khop project: ${md.workspace && exists(md.workspace) && fs.realpathSync(md.workspace) === fs.realpathSync(cfg.projectRoot) ? 'CO' : 'KHONG'}`);
+            if (await waitTurn(conversationId, 'Luot 1')) {
+              const second = await sendMessage({ conversationId, content: 'Phep thu tin nhan tiep theo. Tra loi dung 1 tu: PONG2. Khong dung tool.', kind: 'custom' });
+              pingTurns.set(second.parsed?.pid, second.parsed?.pidTag);
+              L.push('Gui tin tiep (agy --conversation --model): OK');
+              await waitTurn(conversationId, 'Luot 2');
+            }
+            const te = transcriptErrors(conversationId);
+            L.push(`Transcript: ${te.found ? `${te.errorCount} loi stream` : 'khong thay'} · dong tinh: ${conversationProgress(conversationId).lastActivityAt || 'chua thay'}`);
+          } catch (e) {
+            L.push(`PING AGY THAT BAI: ${e.message}`);
+            if (e.hint) L.push(`  Goi y: ${e.hint}`);
+            if (e.detail) L.push(`  Chi tiet: ${truncate(String(e.detail), 1200)}`);
+          } finally {
+            // Ping chi la phep thu: khong de agent skip-permissions chay khong giam sat. Cho toi 90 s: pid co the da thoat va bi tien trinh la
+            // dung lai, nen chi dung khi dau van tay ps con khop. ps hong thi roi ve kill -0 (pid do CHINH ping mo, it giay truoc); da thoat thi thoi.
+            for (const [pid, pidTag] of pingTurns) {
+              if (!pid) continue;
+              let alive = false;
+              try { alive = sameProcess(pid, pidTag); } catch {
+                try { process.kill(pid, 0); alive = true; } catch { /* da thoat */ }
+              }
+              if (!alive) continue;
+              const e2 = killGroup(pid);
+              L.push(e2 ? `CANH BAO: khong dung duoc agy pid ${pid} (${e2.message}); dung no: kill -- -${pid}`
+                : `Ping tu don: da dung agy pid ${pid} (nhom tien trinh): luot van chay khi ping ket thuc.`);
+            }
+          }
+        }
+      }
+      return L.join('\n');
+    },
+  },
+
+  {
+    name: 'pm_task_create',
+    description: 'Mo task moi. definitionOfDone bat buoc va phai kiem chung duoc.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        title: { type: 'string' },
+        brief: { type: 'string', description: 'Hien trang, can lam gi, pham vi duoc sua, cai gi CAM sua' },
+        definitionOfDone: { type: 'array', items: { type: 'string' }, description: 'Dieu kien dat, kiem chung duoc' },
+        type: { type: 'string', enum: TASK_TYPES, description: 'Mac dinh bugfix (doi oracle do->xanh khi mustHave.oracle bat)' },
+        proofKind: { type: 'string', enum: PROOF_KINDS, description: 'device (mac dinh, anh thiet bi) | browser | script (anh do PM chup bang lenh)' },
+        model: { type: 'string', enum: MODELS },
+      },
+      required: ['title', 'brief', 'definitionOfDone'],
+    },
+    async handler(args) {
+      const cfg = ctx(args);
+      const a = validate(this.inputSchema, args);
+      const task = createTask(cfg, a);
+      const p = contractPaths(cfg, task);
+      const tpl = path.join(ensureDir(p.logsDir), 'plan-template.md');
+      writeFileAtomic(tpl, planTemplate(task));
+      return [
+        `Da mo task ${task.id}: ${task.title} (type=${task.type} · proofKind=${task.proofKind})`,
+        `Ho so: ${p.dir}`,
+        `Trang thai: ${task.phase} / ${task.state}`,
+        '',
+        'Buoc tiep: PM tu viet ke hoach roi ghi bang pm_plan (kem files=[...] pham vi de do chong lan). Antigravity chi phan bien va thuc thi.',
+        `Mau ke hoach (co muc "Thu tu buoc NHO -> LON" — agent hay tu choi task lon): ${tpl}`,
+      ].join('\n');
+    },
+  },
+
+  {
+    name: 'pm_plan',
+    description: 'PM ghi ke hoach cua chinh minh vao plan.md. Antigravity KHONG lap ke hoach. '
+      + 'Ghi lai plan thi ban phan bien cu va ket luan plan cu bi huy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        content: { type: 'string', description: 'Noi dung plan.md (markdown)' },
+        file: { type: 'string', description: 'Hoac duong dan file PM da soan san' },
+        files: { type: 'array', items: { type: 'string' }, description: 'Pham vi file task se sua (do chong lan voi task song song)' },
+        forbidden: { type: 'array', items: { type: 'string' }, description: 'File/thu muc CAM dung — cham vao la cong nghiem thu tu choi' },
+        notes: { type: 'string', description: 'Ghi chu cho lich su task' },
+      },
+      required: ['taskId'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      validate(this.inputSchema, args);
+      if (!args.content && !args.file) fail('pm_plan can "content" (noi dung plan) hoac "file" (duong dan file da soan).');
+      if (args.content && args.file) fail('pm_plan chi nhan MOT trong hai: "content" hoac "file".');
+      let body = args.content;
+      if (args.file) {
+        const src = path.resolve(cfg.projectRoot, args.file);
+        if (!fs.existsSync(src)) fail(`Khong thay file ke hoach: ${src}`);
+        body = fs.readFileSync(src, 'utf8');
+      }
+      if (!String(body).trim()) fail('Ke hoach rong — khong ghi.');
+
+      const p = contractPaths(cfg, task);
+      const critique = path.join(p.dir, 'plan-review.json');
+      const lai = fs.existsSync(p.plan);
+      // Luu ban cu (plan + phan bien) de focus=delta co cai ma so; khong xoa lich su (T0024: 9 vong, phan bien cu bien mat).
+      if (lai) {
+        const v = task.planVersion || 1;
+        fs.copyFileSync(p.plan, path.join(ensureDir(p.logsDir), `plan-v${v}.md`));
+        if (fs.existsSync(critique)) fs.renameSync(critique, path.join(p.logsDir, `plan-review-v${v}.json`));
+      }
+      task.planVersion = (task.planVersion || (lai ? 1 : 0)) + 1;
+      writeFileAtomic(p.plan, String(body).endsWith('\n') ? String(body) : `${body}\n`);
+      task.planHash = hashOf(fs.readFileSync(p.plan));
+      // Plan doi => moi thu gan voi plan cu het hieu luc.
+      if (fs.existsSync(critique)) fs.rmSync(critique);
+      if (task.verdicts?.plan) delete task.verdicts.plan;
+      task.planAuthor = 'pm';
+      task.planWrittenAt = nowIso();
+      task.state = 'plan_written';
+      if (Array.isArray(args.files)) task.scopeFiles = args.files.map(String).map((f) => f.trim()).filter(Boolean);
+      if (Array.isArray(args.forbidden)) task.forbiddenPaths = args.forbidden.map(String).map((f) => f.trim()).filter(Boolean);
+      addHistory(task, 'pm', lai ? 'plan_rewritten' : 'plan_written', args.notes || '');
+      save(cfg, task);
+      // #22: duong CAM them sau luc giao trien khai => chup them (trong khoa task, tren ban moi nhat) de doi SAU luc nay bi CHAN.
+      if (Array.isArray(args.forbidden)) updateTask(cfg, task, (t) => chupThemCam(cfg.projectRoot, t));
+      const nhac = kiemTraKeHoach(body);
+      const chongLan = kiemChongLan(cfg, { id: task.id, files: task.scopeFiles || [] }, cacTaskDangChayKhac(cfg, task));
+
+      return [
+        `${lai ? 'Da ghi de' : 'Da ghi'} ke hoach cua PM: ${p.plan} (v${task.planVersion} · plan_hash ${task.planHash.slice(0, 12)})`,
+        lai ? 'Ban phan bien cu va ket luan plan cu da bi huy (ke hoach da doi).' : '',
+        task.scopeFiles?.length ? `Pham vi file: ${task.scopeFiles.length} file.` : 'Chua khai pham vi file (files=[...]) — khong do duoc chong lan voi task song song.',
+        task.forbiddenPaths?.length ? `CAM dung: ${task.forbiddenPaths.join(', ')} (cong nghiem thu se tu choi neu cham).` : '',
+        ...nhac.map((w) => `LUU Y: ${w}`),
+        ...chongLan.overlaps.map((o) => `CHONG LAN voi ${o.taskId} dang chay: ${o.files.join(', ')}`),
+        ...chongLan.exclusive.map((e) => `THU MUC DOC QUYEN "${e.dir}" dang co ${e.taskId} sua — pm_dispatch implement se bi chan cho toi khi task kia xong.`),
+        'Buoc tiep: pm_dispatch kind=plan_review de Antigravity phan bien ke hoach (chi doc, cam sua code).',
+        'Nghe phan bien xong moi duoc pm_verdict kind=plan verdict=pass.',
+      ].filter(Boolean).join('\n');
+    },
+  },
+
+  {
+    name: 'pm_status',
+    description: 'Khong taskId: liet ke task. Co taskId: tien do, bang chung con thieu, hoi thoai con dong tinh khong. nudge=true: nhan danh thuc agent im lau.',
+    inputSchema: {
+      type: 'object',
+      properties: { ...PROJECT_PROP, ...TASK_PROP, nudge: { type: 'boolean', description: 'Gui tin nhac vao hoi thoai lam viec' } },
+    },
+    async handler(args) {
+      if (!args?.taskId) {
+        const cfg = ctx(args);
+        const tasks = listTasks(cfg);
+        if (tasks.length === 0) return `Chua co task nao trong ${cfg.tasksRoot}`;
+        return [`${tasks.length} task · ${cfg.projectName}:`, ...tasks.map(taskLine)].join('\n');
+      }
+      const { cfg, task } = withTask(args);
+      const p = contractPaths(cfg, task);
+      const fresh = freshness(cfg, task);
+      const g = await gateNow(cfg, task);
+      const L = [];
+      L.push(`${task.id} — ${task.title}`);
+      L.push(`Giai doan: ${task.phase} · trang thai: ${task.state} · vong: ${task.round}`);
+      L.push(`Hoi thoai: ${task.conversationId || '(chua giao)'}${task.auditConversationId ? ` · audit: ${task.auditConversationId}` : ''}`);
+      // PM thay luot agy xong qua pm_status: lenh cua agent con song sau luot (mo coi, dot CPU #697) bi dung o day
+      for (const k of reapTurnLeftovers()) L.push(`Da dung lenh mo coi cua agent sau luot agy da xong: pid ${k.pid} (hoi thoai ${k.conversationId}) — ${k.cmd}`);
+      if (task.conversationId) {
+        const prog = conversationProgress(task.conversationId);
+        const regProblem = agyRegistryProblem();
+        if (regProblem) L.push(`SO DANG KY AGY HONG (task agy: khong biet luot nao dang chay nen nudge bi bo qua; task IDE khong bi anh huong): ${regProblem}`);
+        const agyT = safeAgyTurn(L, task.conversationId, conversationModel(task, task.conversationId), Boolean(regProblem));   // null = hoi thoai IDE; con lai: tien trinh agy cua luot hien tai
+        const end = agyT && !agyT.unknown && !agyT.running ? agyTurnEndReason(agyT.out) : null;
+        if (agyT && !agyT.unknown) L.push(agyTurnLine(agyT, end));
+        // Luot implement / rework bi han gio cua PM dung truoc khi co result.json moi: tu gui MOT tin lam tiep cho vong nay
+        const tuLamTiep = await tuLamTiepSauWatchdog(cfg, task, { agyT, end, fresh });
+        L.push(...tuLamTiep.lines);
+        let idle = null;
+        if (prog.found) {
+          idle = prog.idleMinutes;
+          const stalled = prog.idleMinutes >= (cfg.stallMinutes || 12);
+          const stallNote = agyStallNote(agyT?.unknown ? null : agyT);
+          L.push(`Dong tinh cuoi cua agent: ${prog.lastActivityAt} (im ${prog.idleMinutes} phut)${stalled ? stallNote : ''}`);
+          const te = transcriptErrors(task.conversationId);
+          if (te.found && te.lastStepIsError) L.push(`STREAM BI NGAT: buoc cuoi trong transcript la ERROR_MESSAGE (${te.lastErrorAt}) — agent da chet giua chung, nudge/dispatch lai; ${te.errorCount} loi trong doan cuoi.`);
+          else if (te.found && te.errorCount) L.push(`  (transcript co ${te.errorCount} ERROR_MESSAGE gan day, lan cuoi ${te.lastErrorAt} — agent da tu tiep tuc)`);
+          if (stalled && !args.nudge && !agyT?.running && !agyT?.unknown) L.push('  -> send-message danh thuc duoc (do 12/09/2026): goi lai pm_status nudge=true de nhac.');
+        } else {
+          L.push('Chua thay CSDL hoi thoai — agent co the chua bat dau.');
+        }
+        if (args.nudge === true && tuLamTiep.sent) {
+          L.push('Khong nhac them (nudge): vua tu gui tin lam tiep, luot moi dang chay.');
+        } else if (args.nudge === true && agyT?.unknown) {
+          L.push('Khong nhac duoc agent: khong biet trang thai luot agy (ps / so dang ky khong tra loi), khong dam gui chong luot.');
+        } else if (args.nudge === true) {
+          // Bai hoc dem 13-14/09/2026: agent im 30-60 phut, chi tinh khi PM nhan. Nhac KHONG doi round, khong doi moc implementDispatchedAt.
+          const msg = buildNudgeMessage(cfg, task, idle ?? '?');
+          const promptFile = saveOutgoing(cfg, task, `prompt-nudge-${Date.now()}`, msg);
+          try {
+            await sendMessage({ conversationId: task.conversationId, projectId: projectIdFor(cfg), content: msg, kind: 'message', cfg });
+            recordDispatch(cfg, task, { kind: 'nudge', promptFile });
+            L.push(`Da nhac agent (nudge): ${promptFile}`);
+          } catch (e) {
+            if (!agyT || !isTurnBusy(e)) throw e;   // IDE va moi loi that cua agy (mat agy, chinh sach quyen...): no to nhu truoc. Chi "dang chay luot" thi pm_status khong duoc mat bao cao
+            L.push(`Khong nhac duoc agent: ${String(e.message || e).split('\n')[0]}`);
+          }
+        }
+      } else if (args.nudge === true && task.planReviewConversationId && task.phase === 'PLAN') {
+        // Chua co hoi thoai lam viec nhung dang cho phan bien => nhac hoi thoai phan bien.
+        const msg = `# ${task.id} — PM kiem tra: chua thay plan-review.json. Neu da phan bien xong: ghi file dung khuon roi dung. Neu dang doc: tiep tuc.`;
+        // quiet: dong trang thai plan-review.json (tinhTrangPhanBien) da in ly do "KHONG biet", khong lap lai
+        if (safeAgyTurn(L, task.planReviewConversationId, conversationModel(task, task.planReviewConversationId), true)?.unknown) {
+          L.push('Khong nhac duoc hoi thoai phan bien: khong biet trang thai luot agy (ps / so dang ky khong tra loi), khong dam gui chong luot.');
+        } else {
+          try {
+            await sendMessage({ conversationId: task.planReviewConversationId, projectId: projectIdFor(cfg), content: msg, kind: 'plan_review', cfg });
+            recordDispatch(cfg, task, { kind: 'nudge', conversationId: task.planReviewConversationId });
+            L.push('Da nhac hoi thoai phan bien ke hoach (nudge).');
+          } catch (e) {
+            if (!isTurnBusy(e)) throw e;
+            L.push(`Khong nhac duoc hoi thoai phan bien: ${String(e.message || e).split('\n')[0]}`);
+          }
+        }
+      } else if (args.nudge === true) {
+        L.push('Khong nhac duoc: task chua co hoi thoai lam viec.');
+      }
+      L.push('');
+      L.push(`plan.md: ${fresh.planExists ? 'co' : 'chua co'}${task.planVersion ? ` (v${task.planVersion})` : ''}`);
+      L.push(...await tinhTrangPhanBien(cfg, task));
+      L.push(`result.json: ${fresh.resultExists ? (fresh.resultFresh ? `co (ghi luc ${fresh.resultMtime})` : `CU (truoc lan rework ${task.lastReworkAt})`) : 'chua co'}`);
+      if (!fresh.resultFresh && exists(path.join(cfg.projectRoot, 'result.json'))) {
+        L.push(`  CHU Y: co result.json o GOC REPO (${path.join(cfg.projectRoot, 'result.json')}) — agent ghi NHAM cho (Unity T0014). Bao agent ghi lai vao ${p.result}; file o goc la rac.`);
+      }
+      if (fresh.result) {
+        const r = fresh.result;
+        L.push(`  phase=${r.phase || '?'} · summary: ${truncate(r.summary || '', 600)}`);
+        if (r.files_changed?.length) L.push(`  file da sua (${r.files_changed.length}): ${r.files_changed.slice(0, 25).join(', ')}`);
+        if (r.files_to_change?.length) L.push(`  file se sua (${r.files_to_change.length}): ${r.files_to_change.slice(0, 25).join(', ')}`);
+        if (r.tests) L.push(`  agent tu chay test: ${JSON.stringify(r.tests)}`);
+        if (r.screenshots?.length) L.push(`  anh agent tu chup: ${r.screenshots.join(', ')}`);
+        if (r.open_questions?.length) L.push(`  CAU HOI CAN PM CHOT: ${r.open_questions.join(' | ')}`);
+        if (r.blocked) L.push(`  BI VUONG: ${typeof r.blocked === 'string' ? r.blocked : JSON.stringify(r.blocked)}`);
+      }
+      const agentAudit = path.join(p.dir, 'audit-agent.json');
+      if (exists(agentAudit)) {
+        const kq = kiemBaoCao(cfg.projectRoot, readJsonIfExists(agentAudit));
+        L.push(`audit-agent.json: co (auditor doc lap da bao cao) · trich dan: ${dongTomTat(kq)}${kq.bia.some((b) => b.status === 'not-found') ? ' — CO TRICH DAN BIA (not-found), pm_verdict audit pass se bi chan' : ''}`);
+      }
+      if (fresh.result) {
+        const kq = kiemBaoCao(cfg.projectRoot, fresh.result);
+        if (kq.items.length) L.push(`  trich dan trong result.json: ${dongTomTat(kq)}`);
+      }
+      L.push('');
+      L.push(`Ket luan: plan=${task.verdicts?.plan?.verdict || '-'} audit=${task.verdicts?.audit?.verdict || '-'} review=${task.verdicts?.review?.verdict || '-'}`);
+      if (task.openFindings?.length) {
+        L.push(`FINDING CHUA DONG (vong ${task.round}, ${task.openFindings.length}):`);
+        for (const [i, f] of task.openFindings.slice(0, 30).entries()) L.push(`  ${i + 1}. ${truncate(f, 300)}`);
+      }
+      const runs = (task.runs || []).filter((r) => r.round === task.round);
+      L.push(`Lenh da chay vong nay: ${runs.length ? runs.map((r) => `${r.kind}:exit${r.exitCode}`).join(', ') : 'chua co'}`);
+      L.push(`Anh nghiem thu vong nay: ${(task.proofs || []).filter((x) => x.round === task.round).length}/${cfg.proof.require}`);
+      L.push('');
+      L.push(gateLines(g));
+      return L.join('\n');
+    },
+  },
+
+  {
+    name: 'pm_dispatch',
+    description: 'Giao viec: plan (mo hoi thoai, lap ke hoach, cam sua code) | implement (duyet plan, cho lam) | audit (hoi thoai audit doc lap, chi doc) | proof (doi anh) | custom.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        kind: { type: 'string', enum: ['plan_review', 'implement', 'audit', 'proof', 'custom'] },
+        notes: { type: 'string', description: 'Ghi chu PM (implement)' },
+        focus: { type: 'string', enum: ['full', 'delta'], description: 'plan_review: delta = chi phan bien phan doi so voi ban truoc' },
+        message: { type: 'string', description: 'custom: noi dung · proof: can chung minh gi · audit: trong tam' },
+        model: { type: 'string', enum: MODELS },
+        agent: { type: 'string', enum: ['antigravity'], description: 'audit: chi Antigravity (Grok da go 13/11)' },
+        force: { type: 'boolean', description: 'Bo qua kiem tra giai doan' },
+      },
+      required: ['taskId', 'kind'],
+    },
+    async handler(args) {
+      if (args?.kind === 'plan') {
+        fail('Antigravity khong con lap ke hoach nua. PM tu viet ke hoach roi ghi bang pm_plan, '
+          + 'sau do pm_dispatch kind=plan_review de Antigravity phan bien.');
+      }
+      const { cfg, task } = withTask(args);
+      // 13/11/2026: chu repo ngung dung Grok — khong con duong audit/duyet test nao chay hay nhan grok.
+      if (typeof args.agent === 'string' && /^grok/i.test(args.agent.trim())) fail('Grok da bi go khoi audit (chu repo 13/11) — dung pm_dispatch kind=audit (Antigravity).');
+      validate(this.inputSchema, args);
+      const kind = args.kind;
+      const L = [];
+
+      if (kind === 'plan_review') {
+        if (!freshness(cfg, task).planExists) {
+          fail('Chua co plan.md. PM phai viet ke hoach truoc bang pm_plan, roi moi giao phan bien.');
+        }
+        const pth = contractPaths(cfg, task);
+        const planHash = hashOf(fs.readFileSync(pth.plan));
+        // Gan tren object de dung prompt; ghi xuong dia qua recordDispatch (set) sau await — khong ghi de ca object cu.
+        const giao = { planHash, planHashSent: planHash, planReviewDispatchedAt: nowIso() };
+        Object.assign(task, giao);
+        let delta = null;
+        if (args.focus === 'delta') {
+          delta = await deltaKeHoach(cfg, task);
+          if (!delta) L.push('focus=delta: khong co ban ke hoach truoc de so — gui ban day du.');
+        }
+        const prompt = buildPlanCritiquePrompt(cfg, task, { planHash, delta });
+        const promptFile = saveOutgoing(cfg, task, `prompt-plan-review-r${task.round}-v${task.planVersion || 1}`, prompt);
+        const promptBytes = Buffer.byteLength(prompt, 'utf8');
+        if (promptBytes > 20000) L.push(`CANH BAO: prompt ${Math.round(promptBytes / 1024)} KB — agent de chet context (Unity T0007: 3/6 vong treo). Rut plan hoac dung focus=delta.`);
+        const pid = projectIdForModel(cfg, args.model || task.model);
+        const { conversationId } = await newConversation({
+          prompt, projectId: pid.id, cwd: cfg.projectRoot, model: args.model || task.model, title: `[PM] ${task.id} · PHAN BIEN KE HOACH · ${task.title}`, kind: 'plan_review', cfg,
+        });
+        recordDispatch(cfg, task, {
+          kind: 'plan_review', conversationId, model: args.model || task.model, promptFile,
+          set: { ...giao, planReviewConversationId: conversationId, state: 'awaiting_agent' },
+        });
+        L.push(`Da giao PHAN BIEN KE HOACH cho Antigravity. conversationId=${conversationId}`);
+        const check = await ensureWorkspaceMatches(cfg, conversationId);
+        if (!check.ok) {
+          const msg = `Hoi thoai duoc mo trong workspace "${check.got || '(khong ro)'}" chu KHONG phai "${check.want}".`;
+          if (cfg.antigravity.workspaceCheck === 'strict') {
+            updateTask(cfg, task, (t) => { t.state = 'blocked'; addHistory(t, 'system', 'workspace_mismatch', msg); });
+            fail(`${msg}\nAntigravity mo hoi thoai trong project dang mo tren IDE. Hay mo "${check.want}" trong Antigravity roi chay lai pm_dispatch kind=plan_review.\n(Hoi thoai vua tao: ${conversationId} — nen bo/dong trong IDE.)`);
+          }
+          L.push(`CANH BAO: ${msg}`);
+        } else {
+          L.push(`Workspace khop: ${check.got}${check.md.branch ? ` (nhanh ${check.md.branch})` : ''}`);
+        }
+        L.push(`Prompt da luu: ${promptFile}`);
+        L.push(`Ket qua se nam o: ${path.join(contractPaths(cfg, task).dir, 'plan-review.json')}`);
+        L.push('Buoc tiep: doi vai phut roi pm_status. Doc plan-review.json roi hoac sua ke hoach (pm_plan) hoac chot (pm_verdict kind=plan verdict=pass).');
+        return L.join('\n');
+      }
+
+      if (!task.conversationId && !['audit', 'implement'].includes(kind)) {
+        fail('Task chua co hoi thoai lam viec. Chay pm_dispatch kind=implement truoc (buoc do se mo hoi thoai).');
+      }
+
+      if (kind === 'implement') {
+        const fresh = freshness(cfg, task);
+        if (!fresh.planExists && !args.force) fail('Chua co plan.md. PM viet ke hoach truoc bang pm_plan.');
+        if (task.verdicts?.plan?.verdict !== 'pass' && !args.force) {
+          fail('Ke hoach chua duoc chot. Nghe phan bien (pm_dispatch kind=plan_review) roi pm_verdict kind=plan verdict=pass (hoac force=true).');
+        }
+        // Chan chong lan TRUOC khi mo hoi thoai (13/09/2026: hai task cung dung shared/ de len nhau).
+        const guard = await canhBaoTruocKhiGiao(cfg, task, args.force === true);
+        if (guard.blocked) fail(`${guard.blocked}\n${guard.lines.join('\n')}`);
+        const msg = buildImplementMessage(cfg, task, args.notes || '');
+        const promptFile = saveOutgoing(cfg, task, `prompt-implement-r${task.round}`, msg);
+        // byte UTF-8, khong phai so ky tu: tieng Viet co dau / emoji trong plan lam prompt nang hon .length
+        const msgBytes = Buffer.byteLength(msg, 'utf8');
+        if (msgBytes > 20000) guard.lines.push(`prompt ${Math.round(msgBytes / 1024)} KB — agent de chet context; rut plan (promptPlanMaxBytes) hoac tach task.`);
+        // #22: ghi moc commit cho commitPolicy=forbid TRUOC khi agent nhan prompt (lan giao dau; giao loi roi giao lai van giu moc).
+        ghiMocGiao(cfg, task);
+        const moiMo = !task.conversationId;
+        if (moiMo) {
+          // Ke hoach do PM viet nen khong con hoi thoai lap ke hoach de nhan tin — mo hoi thoai lam viec o day.
+          const pidI = projectIdForModel(cfg, args.model || task.model);
+          const { conversationId } = await newConversation({
+            prompt: msg, projectId: pidI.id, cwd: cfg.projectRoot, model: args.model || task.model, title: `[PM] ${task.id} · TRIEN KHAI · ${task.title}`, kind: 'implement', cfg,
+          });
+          // The REAL model (args.model) is recorded now, before the workspace check, and ONLY the model (kind 'open'): a check that fails or
+          // throws must not lose it (conversationModel would fall back to task.model and the agy conversation read as an IDE-tier one), nor
+          // may it leave a dispatch stamp or state behind - those still belong to the recordDispatch below, after the check passed.
+          updateTask(cfg, task, (t) => {
+            t.conversationId = conversationId;
+            (t.dispatches = t.dispatches || []).push({ kind: 'open', conversationId, model: args.model || task.model, round: t.round, promptFile: null, at: nowIso() });
+          });
+          const checkI = await ensureWorkspaceMatches(cfg, conversationId);
+          if (!checkI.ok && cfg.antigravity.workspaceCheck === 'strict') {
+            updateTask(cfg, task, (t) => {
+              t.state = 'blocked';
+              addHistory(t, 'system', 'workspace_mismatch', `${checkI.got || '(khong ro)'} != ${checkI.want}`);
+            });
+            fail(`Hoi thoai mo trong workspace "${checkI.got || '(khong ro)'}" chu khong phai "${checkI.want}". `
+              + `Mo dung project trong Antigravity roi chay lai.\n(Hoi thoai vua tao: ${conversationId} — nen bo/dong trong IDE.)`);
+          }
+        } else {
+          await sendMessage({ conversationId: task.conversationId, projectId: projectIdFor(cfg), content: msg, kind: 'implement', cfg });
+        }
+        setPhase(cfg, task, 'IMPLEMENT', 'pm', 'plan da chot');
+        // Lan MO hoi thoai ghi model THAT (args.model); lan gui vao hoi thoai co san de recordDispatch ghi task.model nhu cu:
+        // conversationModel chi doc ban ghi dau tien cua hoi thoai (lan mo)
+        recordDispatch(cfg, task, {
+          kind: 'implement', conversationId: task.conversationId, ...(moiMo && { model: args.model || task.model }), promptFile, set: { state: 'awaiting_agent' },
+        });
+        return [
+          `Da giao TRIEN KHAI (${task.id})${moiMo ? ` — mo hoi thoai moi ${task.conversationId}` : ''}.`,
+          ...guard.lines.map((l) => `CHU Y: ${l}`),
+          `Noi dung da gui: ${promptFile}`,
+          'Do tren may that 12/09/2026: send-message danh thuc duoc hoi thoai da im 11 phut (dong tinh sau ~1,6 giay).',
+          'Neu 5-10 phut khong thay dong tinh thi moi la bat thuong — xem pm_status.',
+        ].join('\n');
+      }
+
+      if (kind === 'audit') {
+        // 13/11: audit khong `message` tren cay sach ghi pham vi PR (auditedHead, auditBase, edited) vao lan giao — nguon duyet test sua tra
+        // thang cua gate DevKit (thay luot grok cu). Co `message` (pham vi hep, PM dan) hoac cay ban: khong ghi, chi duyet qua approve-tests / trailer.
+        const scope = args.message ? null : await auditScopeOf(cfg);
+        const prompt = buildAuditPrompt(cfg, task, args.message || '', scope);
+        const promptFile = saveOutgoing(cfg, task, `prompt-audit-r${task.round}`, prompt);
+        const pidA = projectIdForModel(cfg, args.model || task.model);
+        const { conversationId } = await newConversation({
+          prompt, projectId: pidA.id, cwd: cfg.projectRoot, model: args.model || task.model, title: `[PM] ${task.id} · AUDIT doc lap`, kind: 'audit', cfg,
+        });
+        updateTask(cfg, task, (t) => { t.auditConversationId = conversationId; });
+        if (task.phase === 'IMPLEMENT') setPhase(cfg, task, 'AUDIT', 'pm', 'da giao audit doc lap');
+        recordDispatch(cfg, task, {
+          kind: 'audit', agent: 'antigravity', conversationId, model: args.model || task.model, promptFile,
+          ...(scope && { extra: { auditedHead: scope.head, auditBase: scope.base, edited: scope.edited } }),
+        });
+        return [
+          `Da mo hoi thoai AUDIT doc lap: ${conversationId}`,
+          `Ket qua se nam o: ${path.join(contractPaths(cfg, task).dir, 'audit-agent.json')}`,
+          scope ? `Pham vi: ${scope.base}..${scope.head} (${scope.edited.length} file da co bi sua/xoa) — ghi vao lan giao.`
+            : 'Khong ghi pham vi (co message, cay ban, file bi che hoac khong tinh duoc merge-base): gate chi duyet test sua qua approve-tests / trailer.',
+          'PM van la nguoi chot: doc audit-agent.json + tu kiem tra, roi pm_verdict kind=audit.',
+        ].join('\n');
+      }
+
+      if (kind === 'proof') {
+        if (!args.message) fail('kind=proof can "message": can chung minh dieu gi bang hinh.');
+        const msg = buildProofRequestMessage(cfg, task, args.message);
+        const promptFile = saveOutgoing(cfg, task, `prompt-proof-r${task.round}`, msg);
+        await sendMessage({ conversationId: task.conversationId, projectId: projectIdFor(cfg), content: msg, kind: 'proof', cfg });
+        recordDispatch(cfg, task, { kind: 'proof', promptFile });
+        return `Da yeu cau agent chup anh nghiem thu. Khi co anh, dung pm_capture_proof voi sourceFile=<duong dan anh> de PM xac nhan va dua vao ho so.`;
+      }
+
+      // custom
+      if (!args.message) fail('kind=custom can "message".');
+      await sendMessage({ conversationId: task.conversationId, projectId: projectIdFor(cfg), content: args.message, kind: 'custom', cfg });
+      const promptFile = saveOutgoing(cfg, task, `prompt-custom-${Date.now()}`, args.message);
+      recordDispatch(cfg, task, { kind: 'custom', promptFile });
+      return 'Da gui tin nhan cho agent.';
+    },
+  },
+
+  {
+    name: 'pm_message',
+    description: 'Gui tin nhan (tham so `content`) vao hoi thoai cua task.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP, ...TASK_PROP,
+        content: { type: 'string', description: 'Noi dung tin nhan' },
+        message: { type: 'string', description: 'Ten khac cua content' },
+        toAudit: { type: 'boolean', description: 'Gui vao hoi thoai audit' },
+      },
+      required: ['taskId'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      // T0021 (14/09/2026): mo ta noi "message", schema doi "content" => 2 lan loi "noi dung rong". Nhan ca hai.
+      const content = String(args.content ?? args.message ?? '').trim();
+      if (!content) fail('Thieu noi dung tin nhan: truyen "content" (hoac "message").');
+      const cid = args.toAudit ? task.auditConversationId : task.conversationId;
+      if (!cid) fail(args.toAudit ? 'Task chua co hoi thoai audit.' : 'Task chua co hoi thoai.');
+      await sendMessage({ conversationId: cid, projectId: projectIdFor(cfg), content, kind: args.toAudit ? 'audit' : 'message', cfg });
+      updateTask(cfg, task, (t) => { addHistory(t, 'pm', 'message', content); });
+      return `Da gui tin nhan vao hoi thoai ${cid}.`;
+    },
+  },
+
+  {
+    name: 'pm_verdict',
+    description: 'Ghi ket luan plan | audit | review. fail thi kem findings roi pm_rework.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        kind: { type: 'string', enum: ['plan', 'audit', 'review'] },
+        verdict: { type: 'string', enum: ['pass', 'fail'] },
+        findings: { type: 'array', items: { type: 'string' }, description: 'Moi phat hien: file:dong + sai gi' },
+        notes: { type: 'string' },
+        auditedHead: { type: 'string', description: 'kind=audit verdict=pass: sha40 cua commit (PR head) da audit; gate chi duyet test o dung cay nay' },
+      },
+      required: ['taskId', 'kind', 'verdict'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      validate(this.inputSchema, args);
+      // Ket luan audit/review chi co nghia khi da co viec trien khai de soi (khong nhay coc giai doan).
+      // Audit T0066 vong 2: task chi audit (audit cheo mot PR co san) co lan giao audit (dispatches kind=audit) la du de ghi audit;
+      // review van can da giao trien khai.
+      const coAudit = (task.dispatches || []).some((d) => d.kind === 'audit');
+      // Lan giao audit gan nhat (theo moc) quyet reviewer: ban ghi cua PM, khong phai chuoi tu khai trong audit-agent.json.
+      // Lan giao khong co truong agent = Antigravity (truoc 03/11/2026 chi co duong agy). Chua giao audit nao: reviewer 'pm' nhu cu.
+      const lastAuditD = (task.dispatches || []).filter((d) => d.kind === 'audit')
+        .reduce((a, d) => (!a || (Date.parse(d.at) || 0) >= (Date.parse(a.at) || 0) ? d : a), null);
+      const auditAgent = lastAuditD ? (lastAuditD.agent || 'antigravity') : null;
+      if (['audit', 'review'].includes(args.kind) && !task.implementDispatchedAt && !(args.kind === 'audit' && coAudit)) {
+        fail(`Chua giao trien khai (pm_dispatch kind=implement) — chua co gi de ${args.kind}.`);
+      }
+      // auditedHead: sha40 cua cay da audit (push_gate.audited_head doc verdicts.audit.auditedHead). Thieu thi lay `auditedHead: <sha40>` trong notes.
+      // Khoang trang viet tuong minh [ \t\n\r\f\v], cung chuoi voi universal-agent-devkit/bin/push_gate.py AUDITED_HEAD; do lech
+      // cua \s Python/JS: universal-agent-devkit/tests/gates/test_audited_head_ascii_space.sh.
+      const AUDITED_HEAD = /(?<![0-9A-Za-z])auditedHead:[ \t\n\r\f\v]*([0-9a-f]{40})(?![0-9A-Za-z])/;
+      // Kiem dung ban notes se luu (recordVerdict cat 8000 ky tu): sha sat cho cat thi ban day du khong khop nhung ban da cat lai khop.
+      const notesIn = String(args.notes || '').slice(0, 8000);
+      const notesHeads = [...notesIn.matchAll(new RegExp(AUDITED_HEAD.source, 'g'))].map((x) => x[1]);
+      // #629: nhieu dong `auditedHead:` khac nhau thi gate doc dong nao cung la doan — tu choi.
+      if (new Set(notesHeads).size > 1) fail(`notes ghi nhieu auditedHead khac nhau (${[...new Set(notesHeads)].join(', ')}) — chi ghi mot head da audit.`);
+      const notesHead = notesHeads[0];
+      let auditedHead;
+      let selfAudit = '';
+      if (args.auditedHead !== undefined) {
+        if (args.kind !== 'audit' || args.verdict !== 'pass') fail('auditedHead chi dung cho kind=audit verdict=pass.');
+        if (typeof args.auditedHead !== 'string' || !/^[0-9a-f]{40}$/.test(args.auditedHead)) fail('auditedHead phai la sha 40 ky tu hex thuong (commit da audit).');
+        // #629: gate DevKit doc ca truong lan `auditedHead:` trong notes — notes ghi sha khac la mot cay chua ai audit.
+        if (notesHead && notesHead !== args.auditedHead) fail(`notes ghi auditedHead ${notesHead}, khac tham so ${args.auditedHead} — chi ghi mot head da audit.`);
+        auditedHead = args.auditedHead;
+      } else if (args.kind === 'audit' && args.verdict === 'pass') {
+        auditedHead = notesHead;
+      }
+      // #629 (review 29/10 sau #609): auditedHead la thu gate DevKit tin de duyet test bi sua, nen chi ghi khi auditor that da bao
+      // cao pass cho dung cay do (audit-agent.json, viet SAU lan giao audit gan nhat, reviewer khac builder); PM tu ghi pass ma
+      // khong co / bo qua bao cao = tu duyet.
+      // 13/11: lan giao audit gan nhat la grok (bien ban truoc khi go Grok) — khong ghi ket luan audit dua tren no.
+      if (args.kind === 'audit' && auditAgent && laGrok(auditAgent)) fail('Lan giao audit gan nhat la grok — Grok da bi go (13/11). Giao lai pm_dispatch kind=audit (Antigravity).');
+      if (auditedHead) {
+        const repFile = path.join(contractPaths(cfg, task).dir, 'audit-agent.json');
+        const rep = readJsonIfExists(repFile);
+        if (!rep) fail('auditedHead can bao cao audit-agent.json cua auditor — chua co (pm_dispatch kind=audit roi cho bao cao).');
+        const lastAudit = Math.max(0, ...(task.dispatches || []).filter((d) => d.kind === 'audit').map((d) => Date.parse(d.at) || 0));
+        // Chua co lan giao audit nao thi moi bao cao deu "moi hon" moc 0: bao cao ghi tay khong duoc thanh auditedHead.
+        if (!lastAudit) fail('Chua co lan giao audit nao (pm_dispatch kind=audit) — audit-agent.json khong do PM giao, khong ghi auditedHead.');
+        if (fs.statSync(repFile).mtimeMs < lastAudit) fail('audit-agent.json cu hon lan giao audit gan nhat — chua phai bao cao cua lan audit nay.');
+        if (String(rep.verdict || '').toLowerCase() !== 'pass') fail(`audit-agent.json ghi verdict "${rep.verdict ?? '(thieu)'}", khong phai pass — khong ghi auditedHead.`);
+        const repHead = typeof rep.auditedHead === 'string' ? rep.auditedHead : AUDITED_HEAD.exec(String(rep.notes || ''))?.[1];
+        if (repHead !== auditedHead) fail(`audit-agent.json ghi auditedHead ${repHead || '(thieu)'}, khac ${auditedHead} — auditor chua audit cay nay.`);
+        // Builder: agent goi PM (DEVKIT_AGENT_ID, mac dinh claude) va TAP danh tinh doc tu env phien (callerAgents, F2/H4); task da giao
+        // implement thi Antigravity cung la builder. G3: ca builders lan reviewer chuan hoa (grok-4.7, grok-build -> grok) truoc khi so.
+        const reviewer = typeof rep.reviewer === 'string' ? normalizeAgent(rep.reviewer) : '';
+        const builders = [...new Set([normalizeAgent(process.env.DEVKIT_AGENT_ID) || 'claude', ...callerAgents(),
+          ...(task.implementDispatchedAt ? ['antigravity'] : [])].map(normalizeAgent).filter(Boolean))];
+        if (!reviewer) fail('audit-agent.json thieu reviewer — khong biet ai audit, khong ghi auditedHead.');
+        if (laGrok(reviewer)) fail(`audit-agent.json ghi reviewer "${rep.reviewer}" — Grok da bi go (13/11), khong ghi auditedHead.`);
+        // Reviewer trung builder (luong /giao: Antigravity build roi audit): van ghi ket luan audit nhung KHONG ghi auditedHead
+        // (ca truong lan dong trong notes, gate doc ca hai) — gate DevKit khong duyet test sua dua vao lan tu audit nay.
+        // OCR P2 (dot 2): reviewer gate tin la auditAgent (verdicts.audit.reviewer), nen so ca auditAgent: bao cao tu khai chuoi la
+        // (vd "gemini-3") khong lach duoc khi Antigravity vua build vua audit.
+        const viaAgent = auditAgent ? normalizeAgent(auditAgent) : '';
+        if (builders.includes(reviewer) || (viaAgent && builders.includes(viaAgent))) {
+          selfAudit = `CANH BAO: reviewer "${rep.reviewer}" (lan giao audit: ${viaAgent || '?'}) trung builder (${builders.join(', ')}) — khong phai duyet cheo, khong ghi auditedHead.`;
+          auditedHead = undefined;
+        }
+        // #632 B: bao cao nay agent cung user OS ghi tay duoc; khi chu repo da cai /private/etc/devkit/verdict-seal.pub, gate DevKit
+        // chi tin auditedHead co seal ky bang khoa Keychain cua _devkitseal (verdict_seal.py), khong tin ban ghi nay.
+      }
+      const notesOut = selfAudit ? notesIn.replace(new RegExp(AUDITED_HEAD.source, 'g'), 'auditedHead-bo-qua') : notesIn;
+      if (args.kind === 'plan' && args.verdict === 'pass') {
+        const pp = contractPaths(cfg, task);
+        if (!fs.existsSync(pp.plan)) fail('Chua co plan.md — PM viet ke hoach bang pm_plan truoc.');
+        const critique = path.join(pp.dir, 'plan-review.json');
+        if (!fs.existsSync(critique)) {
+          fail('Chua nghe phan bien nen chua duoc chot ke hoach cua chinh minh. '
+            + 'Chay pm_dispatch kind=plan_review, doc plan-review.json, roi chot lai.');
+        }
+        if (fs.statSync(critique).mtimeMs < fs.statSync(pp.plan).mtimeMs) {
+          fail('Ban phan bien cu hon plan.md — no phan bien mot ke hoach khac. Chay lai pm_dispatch kind=plan_review.');
+        }
+        const review = readJsonIfExists(critique);
+        const loi = kiemKhuonPlanReview(review);
+        if (loi.length) fail(`plan-review.json sai khuon (${loi.join('; ')}) — chua the coi la da nghe phan bien. pm_status se nhac agent ghi lai.`);
+        // T0024 r7: agent phan bien ban plan CU (neu blocker plan v6 da xu ly). Hash phai khop ban da gui.
+        if (task.planHashSent) {
+          const nay = hashOf(fs.readFileSync(pp.plan));
+          if (review.plan_hash !== task.planHashSent || nay !== task.planHashSent) {
+            fail(`plan_hash khong khop: review ghi "${review.plan_hash || '(thieu)'}", ban da gui ${task.planHashSent.slice(0, 12)}, plan.md hien tai ${nay.slice(0, 12)} — phan bien khong phai cua ban ke hoach nay. Chay lai pm_dispatch kind=plan_review.`);
+          }
+        }
+      }
+      const L = [];
+      if (args.verdict === 'pass' && ['plan', 'audit'].includes(args.kind)) {
+        // Tu kiem trich dan file:dong cua bao cao agent (Unity T0001: 20/27 trich dan la code khong ton tai).
+        const pd = contractPaths(cfg, task).dir;
+        const repFile = path.join(pd, args.kind === 'plan' ? 'plan-review.json' : 'audit-agent.json');
+        const rep = readJsonIfExists(repFile);
+        // audit-agent.json khong theo vong: ban cu hon lan rework/giao trien khai thi bo qua, khong chan hoi to.
+        const cut = Math.max(task.lastReworkAt ? Date.parse(task.lastReworkAt) : 0, task.implementDispatchedAt ? Date.parse(task.implementDispatchedAt) : 0);
+        let cu = false;
+        try { cu = args.kind === 'audit' && rep && Math.floor(fs.statSync(repFile).mtimeMs) <= cut; } catch { cu = false; }
+        if (rep && cu) L.push('audit-agent.json cu hon lan rework/giao trien khai gan nhat — bo qua, khong kiem trich dan.');
+        if (rep && !cu) {
+          const kq = kiemBaoCao(cfg.projectRoot, rep);
+          L.push(`Trich dan trong ${path.basename(repFile)}: ${dongTomTat(kq)}`);
+          // Chi `not-found` (file co, snippet khong co) la bang chung bia chac chan. `file-missing` co the la CHINH finding
+          // ("plan nhac src/New.kt:12 nhung file khong ton tai") => chi canh bao.
+          const bia = kq.bia.filter((b) => b.status === 'not-found');
+          const thieuFile = kq.bia.filter((b) => b.status === 'file-missing');
+          if (thieuFile.length) L.push(`CANH BAO: ${thieuFile.length} trich dan toi file khong ton tai (${thieuFile.slice(0, 5).map((b) => b.file).join(', ')}) — la finding hop le hay bia? PM xem.`);
+          if (bia.length) {
+            fail(`Bao cao ${args.kind} co ${bia.length} trich dan BIA (file co nhung khong co dong code do): ${bia.slice(0, 8).map((b) => `${b.file}:${b.line} [not-found]`).join(', ')}. `
+              + `Khong the coi la da doc/da kiem. Cach go: agent ghi lai ${path.basename(repFile)} voi trich dan that (dispatch lai), hoac PM da tu kiem thi doi file sang logs/ roi ghi ket luan kem notes.`);
+          }
+        }
+      }
+      recordVerdict(cfg, task, {
+        kind: args.kind, verdict: args.verdict, findings: args.findings || [], notes: notesOut, ...(auditedHead && { auditedHead }),
+        // verdicts.audit.reviewer = agent cua lan giao audit gan nhat (antigravity); nguoi ghi ket luan (history) van la PM.
+        ...(args.kind === 'audit' && auditAgent && { reviewer: auditAgent, actor: 'pm' }),
+      });
+      // 13/11: lan giao audit co pham vi nhan ket luan (pass chi khi auditedHead ghi duoc va trung head cua lan giao) — gate DevKit
+      // (push_gate.audit_scope / scoped_audit_runs) doc verdict + finishedAt o day; pass head khac / tu audit: de trong (gate coi la chua pass).
+      if (args.kind === 'audit' && lastAuditD?.auditBase && auditAgent === 'antigravity') {
+        const v = args.verdict === 'fail' ? 'fail' : (auditedHead && auditedHead === lastAuditD.auditedHead ? 'pass' : null);
+        if (v) {
+          updateTask(cfg, task, (t) => {
+            const d = (t.dispatches || []).find((x) => x.kind === 'audit' && x.at === lastAuditD.at && x.auditBase === lastAuditD.auditBase);
+            if (d) { d.verdict = v; d.finishedAt = nowIso(); }
+          });
+        }
+      }
+      if (args.kind === 'audit' && args.verdict === 'pass') {
+        L.push(auditedHead ? `auditedHead = ${auditedHead}.` : (selfAudit || 'CANH BAO: audit pass khong co auditedHead — gate DevKit se khong duyet test sua dua vao audit nay.'));
+        // #632 B: seal mode bat (co pubkey root) thi gate chi duyet head co seal; nhac lenh xin seal khi chua co.
+        if (auditedHead && fs.existsSync('/private/etc/devkit/verdict-seal.pub')) {
+          const home = process.env.ANTIGRAVITY_PM_STATE_HOME || path.join(process.env.HOME || '', '.antigravity-pm');
+          L.push(fs.existsSync(path.join(home, 'seals', `${auditedHead}.json`))
+            ? `seal: co (${auditedHead.slice(0, 12)}).`
+            : `seal: CHUA CO — gate se khong duyet test sua. Chay: python3 <kit>/bin/verdict_seal.py request --repo <repo> --head ${auditedHead} (kit = universal-agent-devkit hoac .agents/devkit)`);
+        }
+      }
+      L.push(`Da ghi ket luan ${args.kind} = ${args.verdict} cho ${task.id} (vong ${task.round}).`);
+      if (args.verdict === 'pass') {
+        const next = { plan: 'IMPLEMENT', audit: 'REVIEW', review: 'TEST' }[args.kind];
+        if (args.kind === 'plan') L.push('Buoc tiep: pm_dispatch kind=implement (buoc nay se mo hoi thoai lam viec neu chua co).');
+        else {
+          setPhase(cfg, task, next, 'pm', `${args.kind} dat`);
+          L.push(`Giai doan -> ${next}.`);
+          if (next === 'TEST') L.push('Buoc tiep: pm_run kind=test.');
+          if (next === 'REVIEW') L.push('Buoc tiep: doc pm_diff roi pm_verdict kind=review.');
+        }
+      } else if (args.kind === 'plan') {
+        // Ke hoach la cua PM: PM tu sua, khong day viec nay sang agent.
+        L.push('Ke hoach nay do chinh PM viet — tu sua roi ghi lai bang pm_plan (ghi lai se huy ban phan bien cu).');
+        L.push('Buoc tiep: pm_plan -> pm_dispatch kind=plan_review -> pm_verdict kind=plan verdict=pass.');
+      } else {
+        L.push('Buoc tiep: pm_rework de tra viec cho agent (kem findings).');
+      }
+      L.push(gateLines(await gateNow(cfg, task)));
+      return L.join('\n');
+    },
+  },
+
+  {
+    name: 'pm_run',
+    description: 'PM tu chay test/audit (ghi exit code + bang chung that) hoac oracle (replay do->xanh tren code goc trong git worktree). Log ra file, chi tra ve duoi log.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        kind: { type: 'string', enum: ['test', 'audit', 'oracle'] },
+        command: { type: 'string', description: 'Ghi de lenh trong cau hinh (oracle: ghi de result.oracle.command)' },
+        stage: { type: 'string', description: 'test: chay mot stage trong testStages (bat buoc kem skipReason)' },
+        worktree: { type: 'boolean', description: 'Chay trong worktree dong bang (HEAD + thay doi hien tai), tranh agent chay build song song' },
+        skipReason: { type: 'string', description: 'Ly do bo phan test con lai (ghi vao ho so)' },
+        timeoutMs: { type: 'number' },
+      },
+      required: ['taskId', 'kind'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      validate(this.inputSchema, args);
+      if (args.kind === 'oracle') return runOracle(cfg, task, args);
+      if (args.stage && args.kind !== 'test') fail('"stage" chi dung voi kind=test.');
+      if (args.stage && !String(args.skipReason || '').trim()) fail('Chay mot stage thi BAT BUOC ghi "skipReason" (bo phan con lai vi sao) — de ho so khong im lang.');
+      if (args.stage && !cfg.testStages?.[args.stage]) fail(`Khong co stage "${args.stage}" trong testStages (co: ${Object.keys(cfg.testStages || {}).join(', ') || 'khong co'}).`);
+      const commands = args.command
+        ? [args.command]
+        : (args.kind === 'test'
+          ? (args.stage ? [cfg.testStages[args.stage]] : (cfg.testCommand ? [cfg.testCommand] : []))
+          : cfg.auditCommands);
+      if (commands.length === 0) {
+        fail(args.kind === 'test'
+          ? `Chua khai "testCommand" trong ${CONFIG_NAME} va khong truyen command. Khong the ghi nhan test.`
+          : `Chua khai "auditCommands" trong ${CONFIG_NAME} va khong truyen command.`);
+      }
+      const p = contractPaths(cfg, task);
+      const L = [];
+      // DE XUAT 5a: cay dong bang. T0021 (14/09/2026) NoSuchFileException vi agent T0022 chay gradle song song
+      // trong cung thu muc. Opt-in — worktree moi khong co build cache (build lanh); khoa build that su
+      // (scripts/lib/build-lock.sh cua project) van phai nam trong chinh testCommand.
+      let cwdRun = cfg.projectRoot;
+      let wt = null;
+      if (args.worktree === true) {
+        wt = await dongBangCay(cfg);
+        if (wt.error) fail(`Khong dung duoc worktree dong bang: ${wt.error}`);
+        cwdRun = wt.dir;
+        L.push(`Chay trong worktree dong bang: ${wt.dir} (HEAD + ${wt.applied} file thay doi, ${wt.untracked} file moi)`);
+      }
+      // Test chay tren cay nao? (de xuat 5c): HEAD + so file dirty, ghi vao dau log.
+      // Vong luc BAT DAU chay: rework chen giua thi cac lan chay nay thuoc vong cu (recordRun dong bo task sau moi lan ghi).
+      const round0 = task.round;
+      const headR = await runShell('git rev-parse --short HEAD 2>/dev/null; git status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l', { cwd: cfg.projectRoot, timeoutMs: 60000 });
+      const [headSha = '?', dirtyN = '?'] = headR.stdout.trim().split('\n').map((x) => x.trim());
+      try {
+      for (const cmd of commands) {
+        const startedMs = Date.now();
+        const r = await runShell(cmd, {
+          cwd: cwdRun,
+          timeoutMs: args.timeoutMs || cfg.runTimeoutMs,
+        });
+        const logFile = path.join(ensureDir(p.logsDir), `${args.kind}-r${round0}-${Date.now()}.log`);
+        writeFileAtomic(logFile, `$ ${cmd}\n(cwd ${cfg.projectRoot} · HEAD ${headSha} · ${dirtyN} file dirty · startedAt ${new Date(startedMs).toISOString()})\nexit=${r.code} timedOut=${r.timedOut}\n\n--- stdout ---\n${r.stdout}\n--- stderr ---\n${r.stderr}\n`);
+        // exit 0 chua phai xanh: T0023 r1 (14/09/2026) `| tail` nuot exit => exit=0 nhung "1 failed" + BUILD FAILED.
+        // Bang chung (src/evidence.js): XML JUnit moi hon luc bat dau chay, hoac it nhat stdout khong noi "khong chay".
+        const evidence = args.kind === 'test'
+          ? collectTestEvidence(wt ? { ...cfg, projectRoot: cwdRun } : cfg, { startedMs, stdout: r.stdout, stderr: r.stderr })
+          : null;
+        recordRun(cfg, task, {
+          kind: args.kind, command: cmd, exitCode: r.code, durationMs: r.durationMs, timedOut: r.timedOut, logFile,
+          evidence, round: round0, startedAt: new Date(startedMs).toISOString(),
+          stage: args.stage || null, skipReason: args.stage ? String(args.skipReason).trim() : null,
+        });
+        if (args.stage) L.push(`CHI CHAY STAGE "${args.stage}" — bo phan con lai vi: ${args.skipReason}`);
+        L.push(`$ ${cmd}`);
+        L.push(`exit=${r.code}${r.timedOut ? ' (QUA HAN)' : ''} · ${Math.round(r.durationMs / 1000)}s · log day du: ${logFile}`);
+        if (evidence) {
+          L.push(`Bang chung test: ${evidenceLine(evidence)}`);
+          if (r.code === 0 && !evidence.ok) {
+            L.push('  -> exit 0 KHONG duoc tinh la xanh. Gradle up-to-date/from-cache: chay lai voi --rerun-tasks. '
+              + 'Test do ma exit 0: lenh dang nuot exit code (| tail, || true) — sua lenh, dung tin.');
+          }
+        }
+        // Xanh thi chi can vai dong cuoi; do thi moi can nhieu de chan doan.
+        // (Log day du luon nam trong file — Read khi thuc su can, dung do het vao context.)
+        const lines = r.code === 0 && !r.timedOut ? 6 : 40;
+        L.push(tail(`${r.stdout}\n${r.stderr}`.trim(), lines));
+        L.push('');
+      }
+      } finally {
+        if (wt) await goWorktree(cfg, wt.dir);
+      }
+      L.push(gateLines(await gateNow(cfg, task)));
+      return L.join('\n');
+    },
+  },
+
+  {
+    name: 'pm_diff',
+    description: 'Agent sua gi that (git). mode=stat (mac dinh, gon) hoac patch (doc ky, ton context). Doi chieu voi file agent khai.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        mode: { type: 'string', enum: ['stat', 'patch'], description: 'stat = chi thong ke' },
+        pathspec: { type: 'string', description: 'Gioi han duong dan' },
+        maxBytes: { type: 'number', description: 'Tran patch, mac dinh 20000' },
+      },
+    },
+    async handler(args) {
+      const live = ctx(args);
+      // Co taskId: dung ban chup (stateDir cua config dang doc co the da bi doi de an thay doi khoi diff).
+      const cfg = args?.taskId ? withGateSnapshot(live, loadTask(live, args.taskId)) : live;
+      const patch = args?.mode === 'patch';
+      const max = args?.maxBytes || 20000;
+      // pathspec di thang vao argv cua git (khong qua shell) — sau '--' nen khong thanh tuy chon duoc.
+      const ps = pathspecArgs(args?.pathspec);
+      const snap = await gitSnapshot(cfg);
+      const stat = await run('git', ['--no-pager', 'diff', '--stat', ...ps], { cwd: cfg.projectRoot, timeoutMs: 120000 });
+      const L = [];
+      L.push(`Project: ${cfg.projectRoot}`);
+      L.push('--- git status ---');
+      L.push(truncate(snap.raw || '(sach)', 4000));
+      const rac = fileRacGocRepo(snap.untracked, cfg);
+      if (rac.length) L.push(`CHU Y — file rac o goc repo (agent de lai script tam?): ${rac.join(', ')}`);
+      if (snap.ok) {
+        const tk = args?.taskId ? loadTask(cfg, args.taskId) : null;
+        const soi = soiThayDoi(cfg.projectRoot, snap.wt, tk ? await baseCommitOf(cfg, tk) : null);
+        for (const b of soi.blockers) L.push(`CHAN — ${b}`);
+        const { hien, daXem } = locCanhBaoDaXem(tk, soi.warnings);
+        for (const w of hien) L.push(`NGHI VA BANG SCRIPT / LAM MEM — ${w.text} [${w.key}]`);
+        if (daXem.length) L.push(`(${daXem.length} canh bao da xem qua pm_ack: ${daXem.map((w) => w.key).join(', ')})`);
+        if (hien.length) L.push('  -> xem xong ma chap nhan duoc: pm_ack keys=[...] note="vi sao" (an o vong nay, vong sau hien lai).');
+        if (tk?.scopeFiles?.length) {
+          const ngoai = snap.untracked.filter((f) => !tk.scopeFiles.some((s) => cungFile(f, s) || f.startsWith(`${s.replace(/\/+$/, '')}/`)));
+          if (ngoai.length) L.push(`CHU Y — file MOI ngoai pham vi plan (${ngoai.length}): ${ngoai.slice(0, 20).join(', ')}`);
+        }
+        if (tk?.forbiddenPaths?.length) {
+          const { fileCamDungTheoTask } = await import('./policy.js');
+          const rs = readJsonIfExists(contractPaths(cfg, tk).result);
+          const cam = fileCamDungTheoTask(tk, snap.wt, Array.isArray(rs?.files_changed) ? rs.files_changed : undefined);
+          if (cam.chan.length) L.push(`CHAN — dung vao file plan CAM sua: ${cam.chan.join(', ')}`);
+          if (cam.canhBao.length) L.push(`CANH BAO — file CAM dang thay doi trong cay nhung task khong khai (phien khac?): ${cam.canhBao.slice(0, 20).join(', ')}`);
+        }
+      }
+      L.push('--- git diff --stat ---');
+      L.push(truncate(stat.stdout || '(khong co thay doi)', 6000));
+      if (patch) {
+        // Khong dat maxBytes = max: run() giu DUOI khi vuot tran, con doc patch can phan DAU (truncate ben duoi cat dau).
+        const diff = await run('git', ['--no-pager', 'diff', ...ps], { cwd: cfg.projectRoot, timeoutMs: 180000 });
+        L.push('--- git diff ---');
+        if (diff.truncated) L.push('CHU Y: diff qua lon — output chi con PHAN CUOI (mat phan dau). Thu hep pathspec roi goi lai.');
+        L.push(truncate(diff.stdout || '(khong co thay doi)', max));
+      } else {
+        L.push('(chua doc patch — goi lai voi mode="patch" va pathspec cua file can review)');
+      }
+      if (args?.taskId) {
+        const tk0 = loadTask(cfg, args.taskId);
+        const base0 = tk0 ? await baseCommitOf(cfg, tk0) : null;
+        if (base0) {
+          const cm = await run('git', ['--no-pager', 'diff', '--stat', `${base0}..HEAD`, ...ps], { cwd: cfg.projectRoot, timeoutMs: 120000 });
+          L.push(`--- da commit ke tu commit goc cua task (${base0.slice(0, 8)}..HEAD) ---`);
+          L.push(truncate(cm.stdout || '(chua co commit nao sau commit goc)', 6000));
+        }
+      }
+      if (args?.taskId) {
+        const task = loadTask(cfg, args.taskId);
+        const fresh = freshness(cfg, task);
+        if (fresh.result?.files_changed?.length) {
+          L.push('');
+          L.push('--- Doi chieu voi khai bao cua agent ---');
+          const claimed = fresh.result.files_changed.map((f) => String(f).replace(/^\.\//, ''));
+          // Cay lam viec HOP commit ke tu commit goc — T0025 (14/09/2026): file da commit bi bao nham "khai ma khong sua".
+          const real = (await changedFilesOf(cfg, task)) || snap.wt || [];
+          // So bang duong dan chuan hoa (bang nhau hoac duoi "/x"), KHONG includes hai chieu: "a.kt" tung khop nham "Data.kt".
+          const notClaimed = real.filter((f) => !claimed.some((c) => cungFile(f, c)));
+          const notTouched = claimed.filter((c) => !real.some((f) => cungFile(f, c)));
+          L.push(`Agent khai sua ${claimed.length} file. Thay doi cua task (cay lam viec + da commit tu commit goc): ${real.length} file.`);
+          if (notClaimed.length) L.push(`CHU Y — thay doi KHONG duoc khai: ${notClaimed.slice(0, 30).join(', ')}`);
+          if (notTouched.length) L.push(`CHU Y — khai co sua nhung khong thay thay doi: ${notTouched.slice(0, 30).join(', ')}`);
+        }
+      }
+      return L.join('\n');
+    },
+  },
+
+  {
+    name: 'pm_capture_proof',
+    description: 'Lay anh nghiem thu vao ho so va tra anh ve cho PM xem. Tu chup (provider) hoac nhan anh co san (sourceFile).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        label: { type: 'string', description: 'Anh chung minh dieu gi' },
+        provider: { type: 'string', description: 'Provider trong cau hinh' },
+        sourceFile: { type: 'string', description: 'Duong dan anh co san (uu tien hon defaultProvider)' },
+        serial: { type: 'string', description: 'Ghi de serial adb' },
+        region: { type: 'string', description: 'Vung macOS x,y,w,h' },
+        url: { type: 'string', description: 'provider browser: URL/file:// can chup' },
+        discardLabel: { type: 'string', description: 'Bo anh hong cung label khoi ho so vong nay truoc khi chup (hoac chi bo, khong chup)' },
+      },
+      required: ['taskId'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      validate(this.inputSchema, args);
+      const p = contractPaths(cfg, task);
+      let bo = 0;
+      if (args.discardLabel) bo = discardProofs(cfg, task, args.discardLabel);
+      if (!args.label) {
+        if (!args.discardLabel) fail('Thieu "label" (anh chung minh dieu gi) — hoac chi "discardLabel" de bo anh hong.');
+        return [`Da bo ${bo} anh "${args.discardLabel}" khoi ho so vong ${task.round}.`, '', gateLines(await gateNow(cfg, task))].join('\n');
+      }
+      const shot = await captureProof(cfg, {
+        proofDir: p.proofDir,
+        label: args.label,
+        providerName: args.provider,
+        sourceFile: args.sourceFile,
+        serial: args.serial,
+        region: args.region,
+        url: args.url,
+      });
+      const sha256 = hashFile(shot.file);
+      const trung = anhTrung(cfg, task, sha256);
+      recordProof(cfg, task, { label: args.label, provider: shot.provider, file: shot.file, bytes: shot.bytes, width: shot.width, sha256 });
+      if (task.phase === 'TEST') setPhase(cfg, task, 'PROOF', 'pm', 'da co anh nghiem thu');
+      const text = [
+        bo ? `Da bo ${bo} anh "${args.discardLabel}" khoi ho so vong ${task.round}.` : '',
+        `Da luu anh nghiem thu: ${shot.file}`,
+        trung.length ? `CANH BAO: anh TRUNG BYTE (sha256 ${sha256.slice(0, 12)}) voi ${trung.join('; ')} — render deterministic hop le hay chup nham cai cu? PM phai biet.` : '',
+        `Cach chup: ${shot.provider} · ${Math.round(shot.bytes / 1024)} KB${shot.width ? ` · ${shot.width}px` : ''}`,
+        ...shot.warnings.map((w) => `CANH BAO: ${w}`),
+        '',
+        gateLines(await gateNow(cfg, task)),
+      ].join('\n');
+      return { text, images: [{ mime: shot.mime, base64: shot.base64 }] };
+    },
+  },
+
+  {
+    name: 'pm_rework',
+    description: 'Tra viec: vong +1, huy ket luan audit/review cu, gui findings cho agent.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        findings: { type: 'array', items: { type: 'string' } },
+        notes: { type: 'string' },
+      },
+      required: ['taskId', 'findings'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      validate(this.inputSchema, args);
+      const findings = (args.findings || []).map(String).filter(Boolean);
+      if (findings.length === 0) fail('findings rong — tra viec phai noi ro sai cho nao.');
+      // pm_rework la tra viec CODE. Ke hoach chua duyet ma goi no la day agent di code som.
+      if (task.phase === 'PLAN' || task.verdicts?.plan?.verdict !== 'pass') {
+        fail('Ke hoach chua duoc chot nen chua co gi de tra viec. Sua ke hoach bang pm_plan, '
+          + 'cho phan bien (pm_dispatch kind=plan_review), roi chot bang pm_verdict kind=plan verdict=pass.');
+      }
+      const failedRuns = (task.runs || []).filter((r) => r.round === task.round && r.exitCode !== 0);
+      const blockedCu = freshness(cfg, task).result?.blocked;
+      const tuChoiViLon = blockedCu && /phuc tap|phức tạp|qua lon|quá lớn|complex|too (?:big|large|many)|out of scope/i.test(
+        typeof blockedCu === 'string' ? blockedCu : JSON.stringify(blockedCu));
+      // GUI TRUOC, ghi trang thai SAU: gui loi (mang, Antigravity dong) thi task giu nguyen vong => goi lai an toan,
+      // khong tang vong hai lan va khong co vong "da tra viec" ma agent chua he nhan (re-audit 23/09).
+      const nextRound = (task.round || 0) + 1;
+      const msg = buildReworkMessage(cfg, { ...task, round: nextRound }, { findings, notes: args.notes || '', failedRuns });
+      const promptFile = saveOutgoing(cfg, task, `prompt-rework-r${nextRound}`, msg);
+      if (task.conversationId) {
+        await sendMessage({ conversationId: task.conversationId, projectId: projectIdFor(cfg), content: msg, kind: 'rework', cfg });
+      }
+      markRework(cfg, task, `${findings.length} phat hien: ${findings[0]}`, findings);
+      if (task.conversationId) recordDispatch(cfg, task, { kind: 'rework', promptFile });
+      return [
+        `Da tra viec ${task.id} (nay la vong ${task.round}).`,
+        'Da huy ket luan audit + review cua vong truoc; test/anh cu khong con tinh nua.',
+        `Noi dung da gui: ${promptFile}`,
+        tuChoiViLon ? 'LUU Y: agent vua tu choi vi "qua phuc tap" — bai hoc T0012/T0022: findings nen la thu tu buoc NHO -> LON, moi buoc mot viec; giao tung buoc thi no lam duoc.' : '',
+        task.conversationId ? '' : 'CHU Y: task chua co hoi thoai nen chi ghi nhan noi bo, chua gui duoc cho agent.',
+      ].filter(Boolean).join('\n');
+    },
+  },
+
+  {
+    name: 'pm_accept',
+    description: 'Nghiem thu. Chi dat khi du: plan duyet + result.json moi + audit + review + test exit 0 + du anh. Thieu la tu choi.',
+    inputSchema: {
+      type: 'object',
+      properties: { ...PROJECT_PROP, ...TASK_PROP, summary: { type: 'string', description: 'Ket luan PM ghi vao bao cao' } },
+      required: ['taskId'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      const gctx = await gateCtx(cfg, task);
+      const g = gate(cfg, task, gctx);
+      if (!g.ok) {
+        const rep = renderReport(cfg, task, { summary: args.summary || '', gateCtx: gctx });
+        return {
+          text: [
+            `TU CHOI NGHIEM THU ${task.id} — chua du bang chung:`,
+            ...g.missing.map((m) => `- ${m}`),
+            '',
+            `Bao cao hien trang (van xuat de xem): ${rep.file}`,
+          ].join('\n'),
+          isError: true,
+        };
+      }
+      accept(cfg, task, gctx);
+      const rep = renderReport(cfg, task, { summary: args.summary || '', gateCtx: gctx });
+      const proofs = (task.proofs || []).filter((p) => p.round === task.round);
+      return [
+        `NGHIEM THU DAT: ${task.id} — ${task.title}`,
+        `Vong lam: ${task.round} · nghiem thu luc ${task.acceptedAt}`,
+        `Bao cao: ${rep.file}`,
+        `Anh nghiem thu (${proofs.length}):`,
+        ...proofs.map((p) => `- ${p.label}: ${p.file}`),
+      ].join('\n');
+    },
+  },
+
+  {
+    name: 'pm_ack',
+    description: 'PM danh dau DA XEM canh bao heuristic (khoa [loai:file] in kem canh bao); note bat buoc; chi an trong vong hien tai.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...PROJECT_PROP,
+        ...TASK_PROP,
+        keys: { type: 'array', items: { type: 'string' }, description: 'Khoa canh bao, vi du "assert-xoa:src/test/ATest.kt"' },
+        note: { type: 'string', description: 'Vi sao chap nhan (nguoi sau doc)' },
+      },
+      required: ['taskId', 'keys', 'note'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      validate(this.inputSchema, args);
+      const truoc = Object.keys(task.ackWarnings || {}).length;
+      ackWarning(cfg, task, args.keys, args.note);
+      return [
+        `Da danh dau ${Object.keys(task.ackWarnings).length - truoc} canh bao moi (tong ${Object.keys(task.ackWarnings).length}) o vong ${task.round}: ${args.keys.join(', ')}`,
+        `Ghi chu: ${args.note}`,
+        'Canh bao nay an o pm_status/pm_diff/pm_accept cua vong nay; sang vong moi (pm_rework) se hien lai vi code da doi.',
+        '',
+        gateLines(await gateNow(cfg, task)),
+      ].join('\n');
+    },
+  },
+
+  {
+    name: 'pm_report',
+    description: 'Xuat bao cao nghiem thu ra file md (nhung anh). Tra ve duong dan; includeMarkdown=true moi do noi dung vao context.',
+    inputSchema: {
+      type: 'object',
+      properties: { ...PROJECT_PROP, ...TASK_PROP, summary: { type: 'string' }, includeMarkdown: { type: 'boolean' } },
+      required: ['taskId'],
+    },
+    async handler(args) {
+      const { cfg, task } = withTask(args);
+      const rep = renderReport(cfg, task, { summary: args.summary || '', gateCtx: await gateCtx(cfg, task) });
+      const head = [`Bao cao: ${rep.file}`, gateLines(rep.gate)];
+      // Mac dinh KHONG do ca bao cao vao context — day duong dan, can thi Read.
+      return args?.includeMarkdown === true ? `${head.join('\n')}\n\n${rep.markdown}` : head.join('\n');
+    },
+  },
+];
+
+export const TOOLS_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));

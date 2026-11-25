@@ -1,0 +1,171 @@
+# Cấu hình
+
+Repo này là công cụ dùng chung. Cấu hình đọc theo **hai tầng**:
+
+| Tầng | File | Dùng khi |
+| --- | --- | --- |
+| Chung (mọi project) | `~/.antigravity-pm.json` | Những thứ giống nhau ở mọi project: `commitPolicy`, `defaultModel`, cách chụp màn hình máy, `runTimeoutMs`… |
+| Riêng từng project | `<project>/.antigravity-pm.json` | Những thứ chỉ project đó có: `testCommand`, `auditCommands`, `rulesFiles`, thiết bị chụp ảnh… |
+
+Thứ tự đè lên nhau: **mặc định → cấu hình chung → cấu hình project** (project luôn thắng).
+
+- **Object gộp theo khoá.** `proof.providers` khai `man` ở tầng chung và `may` ở tầng project ⇒ dùng được cả hai.
+- **Mảng bị thay thế hẳn, không nối đuôi.** `rulesFiles`, `auditCommands` khai lại ở project ⇒ danh sách chung bị bỏ
+  hoàn toàn. Cố ý như vậy: nối đuôi thì project không có cách nào **bỏ** một mục mà tầng chung đã khai.
+- Đường dẫn tương đối trong cấu hình chung (`rulesFiles`, `stateDir`) tính theo gốc **của từng project**, không phải
+  theo `$HOME`.
+- Không có tầng chung thì mọi thứ chạy y như cũ. `pm_doctor` in ra cả hai dòng để biết giá trị đến từ đâu.
+- **`projectName` và `antigravity.projectId` bị bỏ qua ở tầng chung** (kèm cảnh báo trong `pm_doctor`): hai khoá đó
+  là của riêng từng project, để ở tầng chung thì mọi project bị đặt cùng tên / trỏ về cùng một workspace.
+- File cấu hình **hỏng JSON** ⇒ cảnh báo nêu tên file rồi bỏ qua cả file đó, không âm thầm nuốt lỗi.
+
+> `~/.antigravity-pm.json` **không** bị tính là gốc project: một repo nằm dưới `$HOME` mà chưa khai cấu hình riêng
+> vẫn lấy gốc theo `.git` của chính nó.
+
+## Toàn bộ khoá
+
+| Khoá | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `projectName` | tên thư mục | Chỉ để báo cáo cho dễ đọc |
+| `giaoDefault` | `false` | Cờ mặc định của `/giao` (đặt ở file chung hoặc file project, project đè lên): `true` = mọi prompt có việc sửa file/code tự chạy skill `giao`. Server này **không đọc** khóa; hook prompt của DevKit (`scripts/context/enrich_context.py`) đọc, khai ở đây để loader không báo "khóa lạ". Chi tiết: `skills/giao/SKILL.md` §0 của DevKit |
+| `defaultModel` | `"gemini-4-hydrogen-high"` | Model Antigravity. Bậc `flash_lite` \| `flash` \| `pro` đi qua `agentapi` (server tự chọn model: 14/10/2026 cả `pro` lẫn `flash` ra `gemini-3.8-flash-tiered`). Model cụ thể `gemini-4-hydrogen-high\|medium\|low`, `gemini-4-argon-high\|medium\|low`, `gemini-3.8-flash-high\|medium\|low` đi qua CLI `agy --model` (cách duy nhất chọn được model); cần `agy` (`~/.local/bin/agy`, hoặc `ANTIGRAVITY_PM_AGY`), không có thì báo lỗi chứ **không** tự rơi về flash |
+| `stateDir` | `".antigravity-pm"` | Thư mục file hợp đồng của task (brief/plan/result.json/proof/logs), tính từ gốc project. `task.json` của PM **không** nằm ở đây mà ở `~/.antigravity-pm/projects/<tên>-<hash>/tasks/` (biến môi trường `ANTIGRAVITY_PM_STATE_HOME` đổi gốc `~/.antigravity-pm`) |
+| `rulesFiles` | `["AGENTS.md", "CLAUDE.md"]` | File luật **bắt buộc agent đọc**; file không tồn tại thì bị bỏ qua im lặng (không nhét vào prompt) |
+| `testCommand` | `null` | Lệnh test thật. **Chưa khai thì `pm_run kind=test` báo lỗi** ⇒ cổng nghiệm thu không bao giờ đạt |
+| `auditCommands` | `[]` | Các cổng chặn / lint / verify của project, chạy tuần tự bằng `pm_run kind=audit` |
+| `commitPolicy` | `"forbid"` | `forbid` ⇒ prompt cấm agent `git commit` / `push` / `reset --hard`. Giá trị lạ tự về `forbid` |
+| `runTimeoutMs` | `900000` | Hạn cho mỗi lệnh test/audit (15 phút) |
+| `stallMinutes` | `12` | Im lâu hơn mức này thì `pm_status` cảnh báo "có thể đang treo" |
+| `agyTurnMaxMs` | `{"implement": 5400000, "rework": 5400000, "message": 5400000, "default": 1200000}` | Hạn cứng của một lượt `agy` theo loại lượt (`plan_review` · `implement` · `rework` · `audit` · `proof` · `custom` · `message`); số ms = mọi loại, object = theo loại rồi `default`; `0` = tắt. Vượt hạn thì PM dừng cả nhóm agy và ghi lỗi vào tệp lượt. Env `PM_AGY_TURN_MAX_MS` đè lên mọi loại |
+| `agySilentMaxMs` | `{"default": 600000}` | Hạn im lặng (tệp lượt không lớn thêm), cùng khuôn. Env `PM_AGY_SILENT_MAX_MS` |
+| `agyBackgroundSilentMaxMs` | `{"default": 2700000}` | Hạn im lặng **khi agy đang chờ lệnh nền** (dòng cuối của tệp lượt là `waiting for … background task`, hoặc nhóm agy còn lệnh mang `ANTIGRAVITY_AGENT=1`), thay cho `agySilentMaxMs`; hạn cứng vẫn áp. `0` = không giới hạn im lặng lúc chờ. Env `PM_AGY_BG_SILENT_MAX_MS` |
+| `proof.require` | `1` | Số ảnh nghiệm thu tối thiểu **mỗi vòng làm** |
+| `proof.defaultProvider` | `null` | Provider dùng khi `pm_capture_proof` không chỉ định. Nếu chỉ khai đúng 1 provider thì tự chọn cái đó |
+| `proof.providers` | `{}` | Khai cách chụp, xem dưới |
+| `proof.maxWidth` | `1280` | Thu nhỏ ảnh về chiều ngang này (dùng `sips`) |
+| `testEvidence.resultsGlob` | `[]` | Glob XML JUnit để `pm_run kind=test` **đếm test thật** (chỉ XML có mtime ≥ lúc bắt đầu chạy). Android/Gradle: `["**/build/test-results/**/TEST-*.xml"]`. Rỗng = chỉ có stdout (bằng chứng `weak`) |
+| `oracle.copyToWorktree` | `[]` | File **hoặc thư mục** (đệ quy, bỏ `build/`, `.gradle/`) chép vào worktree khi `pm_run kind=oracle` / `worktree=true`: `local.properties`, keystore, **lib nhị phân bị gitignore** (GeelyEx2: `CarConnect/app/libs` 47 MB — thiếu là Gradle đỏ trước khi tới test, đo 14/09/2026) |
+| `testStages` | `{}` | Lệnh test theo stage, vd `{"unit": "./scripts/test-all.sh --unit"}` — dùng với `pm_run kind=test stage=unit skipReason="..."` khi cổng ngoài đỏ vì lý do ngoài code |
+| `promptPlanMaxBytes` | `12000` | Trần số ký tự `plan.md` nhúng vào prompt; phần dư agent đọc theo đường dẫn. Plan 38 KB từng làm agent chết context |
+| `proof.providers.<tên>.type = "browser"` | — | Chrome/Chromium headless: `binary` (tự dò nếu bỏ trống), `windowSize` (`1280,800`), `url` mặc định, `args`. Dùng cho task `proofKind: browser` |
+| `proof.providers.<tên>.type = "qa-visual"` | — | Playwright / qa-visual chụp ảnh web: tự động đợi font/mạng ổn định, hỗ trợ form login và đo layout DOM: `url`, `width`, `height`, `fullPage` |
+| `antigravity.workspaceCheck` | `"strict"` | `strict` ⇒ `pm_dispatch` **thất bại** nếu hội thoại mở trong workspace khác; `warn` ⇒ chỉ cảnh báo |
+| `antigravity.projectId` | `null` | Thử nghiệm, chưa chắc Antigravity tôn trọng |
+
+Khoá lạ chỉ sinh cảnh báo trong `pm_doctor`, không làm server nổ.
+
+## Luật bắt buộc (`mustHave`)
+
+Hai điều kiện này **nằm trong cổng nghiệm thu**, áp cho mọi task, không phụ thuộc PM có ghi vào `definitionOfDone` hay không. Agent cũng được nhắc thẳng trong prompt.
+
+| Khoá | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `mustHave.testChange` | `true` | Thay đổi **phải kèm file test** (thêm mới hoặc sửa test hiện có). Test cũ vẫn xanh **không** chứng minh được gì về phần mới ⇒ `pm_accept` từ chối |
+| `mustHave.testFilePatterns` | glob mặc định | Cách nhận diện file test. Mặc định phủ `**/src/test/**`, `**/src/androidTest/**`, `**/test/**`, `**/tests/**`, `**/__tests__/**`, `**/*Test.*`, `**/*_test.*`, `**/*.test.*`, `**/*.spec.*` |
+| `mustHave.proofFrom` | `[]` | Ảnh nghiệm thu **phải** chụp bằng một trong các provider này. Rỗng = nhận mọi provider |
+| `mustHave.oracle` | `false` | Task `type=bugfix` (hoặc agent tự khai `oracle.command`) phải có oracle đỏ→xanh **do PM tự replay** (`pm_run kind=oracle`). Task tạo trước khi có trường `type` được miễn |
+| `mustHave.exclusiveDirs` | `[]` | Thư mục độc quyền: `pm_dispatch kind=implement` **chặn** khi task khác đang chạy cũng đụng vào (vd `["shared/"]`), trừ `force=true` |
+| `mustHave.testSuspectPatterns` | `[]` | Regex thêm để coi một lần test là "chưa chạy thật" dù `exit 0` (bộ mặc định: `src/evidence.js`) |
+| `mustHave.strayFilePatterns` | `fix_*.py`, `update_*.py`, `modify_*.py`, `patch_*.{py,sh,rb}`, `fix_*.sh`, `update_*.sh`, `*_patch.*`, `*.bak`, `*.orig`, `*.rej`, `test_debug.sh`, `result.json`, `plan-review.json`, `audit-agent.json`, `plan.md` | File rác agent hay để lại ở **gốc** repo (kể cả hợp đồng ghi nhầm chỗ) |
+| `mustHave.strayFiles` | `"block"` | `block` ⇒ `pm_accept` từ chối khi còn file rác; `warn` ⇒ chỉ cảnh báo |
+
+```json
+{
+  "mustHave": {
+    "testChange": true,
+    "proofFrom": ["xe", "mayao"],
+    "oracle": true,
+    "exclusiveDirs": ["shared/"]
+  },
+  "testEvidence": { "resultsGlob": ["**/build/test-results/**/TEST-*.xml"] }
+}
+```
+
+Với cấu hình trên (GeelyEx2 đang dùng): ảnh chụp bằng `man` (màn hình máy) hay ảnh agent tự đưa (`sourceFile` ⇒ provider `file`) **không được tính** — phải là ảnh chụp từ đầu xe hoặc máy ảo.
+
+Danh sách file thay đổi được đo bằng `git status --untracked-files=all` **ngay lúc gọi** `pm_accept` ∪ các commit kể từ `baseCommit` của task. Không đọc được git (project không phải repo) ⇒ cổng chặn báo `CHUA XAC MINH duoc co file test nao thay doi` và **không** cho qua — nghiêng về phía chặn, không phía tin.
+
+**File test phải là của agent** (14/09/2026): chỉ file test nằm trong `files_changed` agent khai mới được tính — cây làm việc dùng chung nhiều phiên, file test của phiên khác không chứng minh gì cho task này. Agent khai `files_changed` rỗng mà cây có thay đổi ⇒ chặn, không đếm hộ.
+
+**Thứ tự thời gian** (14/09/2026): lần test xanh phải **bắt đầu sau** `mtime(result.json)` và **kết thúc sau** lần sửa cuối của **file thuộc task** (file agent khai trong `files_changed` ∪ file test đang thay đổi — không đo cả cây, vì phiên khác sửa repo song song sẽ bắt chạy lại test vô ích; chủ dự án chốt 14/09/2026). Test chạy trước khi agent báo cáo ⇒ chặn, nhắn chạy lại `pm_run kind=test`.
+
+**`exit 0` không phải xanh** (14/09/2026): mỗi lần `pm_run kind=test` ghi kèm `evidence` (`src/evidence.js`). Chỉ `isGreenRun` = `exit 0` + không quá hạn + `evidence.ok` mới được tính. Bắt: Gradle không task nào `executed` (up-to-date / from-cache), task **test** `UP-TO-DATE`, `No tests found`, và lỗi bị **nuốt exit code** (`BUILD FAILED`, `N tests completed, M failed`, `failures=N` mà vẫn exit 0 — đo được T0023 r1 trên Geely EX2). Run không có `evidence` (ghi bởi bản cũ) = không xanh.
+
+`pm_doctor` in ra luật đang hiệu lực:
+
+```
+LUAT BAT BUOC — thay doi phai kem file test: CO · anh phai chup tu: xe hoac mayao
+  · oracle do->xanh PM tu replay: CO (task bugfix) · thu muc doc quyen (khong giao song song): shared
+  · bang chung test: XML JUnit **/build/test-results/**/TEST-*.xml · file chep vao worktree oracle: (khong)
+```
+
+## Cách chụp ảnh nghiệm thu
+
+### `adb` — chụp từ thiết bị Android / đầu xe / máy ảo
+
+```json
+{ "type": "adb", "serial": "192.168.1.20:5555", "avd": "PhoneConnect", "adb": "adb", "connectTimeoutMs": 5000, "bootTimeoutMs": 180000, "timeoutMs": 60000 }
+```
+
+Chạy `adb devices` trước, rồi `adb exec-out screencap -p` **chỉ khi** serial đang ở trạng thái `device`.
+
+- Serial dạng `ip:cổng` mà chưa có trong danh sách: `adb connect` tối đa `connectTimeoutMs` (mặc định 5 giây). Hết giờ mà vẫn không `device` thì **không** screencap vào địa chỉ đó.
+- Khai `avd` thì mở emulator đó (`-port` trống đầu tiên từ 5554), đợi `sys.boot_completed=1` trong `bootTimeoutMs` (mặc định 180 giây), rồi chụp serial `emulator-<cổng>`. AVD cùng tên đã chạy thì dùng luôn, không mở thêm.
+- Không có `avd`: chuyển sang provider `whenOffline`, hoặc provider `browser` / `qa-visual` / `playwright` nếu có. Web có `start` thì chạy lệnh đó khi cổng chưa nghe.
+- Serial trong denylist (`.adb-denylist`, `~/.config/universal-agent-devkit/adb-denylist`, `ADB_DENY_SERIALS`) không được chụp, kể cả khi đó là máy duy nhất đang cắm.
+- `serial` bỏ trống và đúng một máy `device` không bị cấm ⇒ dùng máy đó. Nhiều máy ⇒ phải khai serial.
+
+Ghi đè tại chỗ gọi: `pm_capture_proof { serial: "emulator-5554" }`. `pm_doctor` in serial nào đang online và serial offline sẽ mở AVD nào.
+
+### `macos` — chụp màn hình máy
+
+```json
+{ "type": "macos", "region": "0,0,1440,900" }
+```
+
+`region` dạng `x,y,w,h` (bỏ trống = toàn màn hình), `window` = id cửa sổ. Lần đầu macOS sẽ hỏi quyền Screen Recording cho tiến trình chạy MCP.
+
+### `shell` — lệnh tuỳ ý
+
+```json
+{ "type": "shell", "command": "npx playwright screenshot http://localhost:5173 {{out}}" }
+```
+
+`{{out}}` được thay bằng đường dẫn file đích, `{{project}}` bằng gốc checkout đang chụp. Cả hai được bọc nháy cho shell. Lệnh chạy với `cwd` = gốc project. Exit code khác 0, hoặc file sinh ra không phải PNG/JPEG ⇒ **báo lỗi thẳng**, không nhận làm bằng chứng.
+
+### `file` — nhận ảnh agent đã chụp
+
+Không cần khai trong config:
+
+```
+pm_capture_proof { taskId, label: "...", sourceFile: "/duong/dan/anh.png" }
+```
+
+## Kiểm tra ảnh
+
+| Kiểm | Xử lý |
+| --- | --- |
+| Magic byte không phải PNG/JPEG | Từ chối, in 200 byte đầu để biết lệnh đã in ra cái gì |
+| Nhỏ hơn 8 KB | Nhận nhưng **cảnh báo** "rất có thể màn hình đang tắt/trắng" |
+| Rộng hơn `proof.maxWidth` | Thu nhỏ bằng `sips` |
+| Base64 vượt ~1,2 MB | Thu nhỏ tiếp về 900px rồi 640px để nhét được vào khối ảnh MCP |
+
+## Biến môi trường
+
+| Biến | Việc |
+| --- | --- |
+| `ANTIGRAVITY_PM_PROJECT` | Project mặc định khi tool không truyền `project` |
+| `ANTIGRAVITY_PM_AGENTAPI` | Trỏ tới binary `agentapi` khác (khi Antigravity cài chỗ lạ) |
+| `ANTIGRAVITY_PM_QUIET` | `1` ⇒ tắt log stderr |
+| `ANTIGRAVITY_PM_PS_TIMEOUT_MS` | Hạn chờ mỗi lệnh `ps` đọc dấu vân tay tiến trình (mặc định 5000, trần 7000; máy rất bận thì nâng lên) |
+| `ANTIGRAVITY_PM_GLOBAL_CONFIG` | Trỏ cấu hình chung sang file khác thay cho `~/.antigravity-pm.json` |
+
+Server tự dò địa chỉ language server của IDE đang chạy; nếu MCP được khởi động **từ trong terminal của Antigravity** thì nó dùng luôn biến môi trường mà IDE đã bơm vào.
+
+## Gốc project được tìm thế nào
+
+1. Đi lên từ đường dẫn truyền vào, tìm thư mục có `.antigravity-pm.json` (bỏ qua chính file cấu hình chung)
+2. Không có thì tìm thư mục có `.git`
+3. Không có nữa thì dùng chính đường dẫn đó
+
+Nhờ vậy truyền `project` là một thư mục con sâu trong repo vẫn ra đúng gốc.

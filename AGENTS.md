@@ -1,0 +1,99 @@
+# AGENTS.md — Luật bất biến của antigravity-pm-mcp
+
+> Repo này là **công cụ điều phối**: Claude Code (Leader/PM) giao việc cho Antigravity (Engineer),
+> rồi audit / review / test / đòi ảnh nghiệm thu. Đọc file này trước khi sửa bất cứ thứ gì.
+
+## 1. Sáu luật không được vi phạm
+
+1. **Cổng nghiệm thu không được làm mềm.** `gate()` trong [`src/tasks.js`](src/tasks.js) là lý do repo này tồn tại.
+   Cấm thêm cờ bỏ qua, cấm `force` trên `pm_accept`, cấm coi "agent bảo test xanh" là bằng chứng.
+   Bằng chứng duy nhất được tính: `plan.md` + PM duyệt plan + `result.json` mới + audit đạt + review đạt +
+   test **xanh theo `isGreenRun`** (exit 0 + `evidence.ok`, do **PM tự chạy**, chạy **sau** khi agent báo cáo) +
+   đủ ảnh nghiệm thu tồn tại trên đĩa (+ oracle do PM replay khi `mustHave.oracle`). `exit 0` suông không phải xanh.
+2. **Hai luật bắt buộc của chủ dự án không được tắt ngầm** ([`src/policy.js`](src/policy.js)):
+   thay đổi phải **kèm file test**, và ảnh nghiệm thu phải chụp từ **provider thiết bị thật** khi project khai
+   `mustHave.proofFrom`. Không đo được danh sách file thay đổi ⇒ báo `CHUA XAC MINH` và **chặn**, không cho qua.
+3. **Bằng chứng thuộc về một vòng làm.** Sau `pm_rework`, mọi kết luận audit/review, lần chạy test và ảnh của
+   vòng trước **mất hiệu lực** (so bằng `round`), và `result.json` phải được ghi **sau** mốc rework
+   (so bằng `mtime`, nghiêng về phía "coi là cũ" cho an toàn).
+4. **Khoá phiên loopback chỉ ở trong RAM.** Không ghi ra file, không log, không trả về cho model.
+   Cache chỉ được lưu `pid` + cổng. Mọi chuỗi trả ra phải đi qua `redact()`.
+5. **Không nuốt exit code, không nuốt lỗi.** `run()` luôn trả exit code thật; `agentapi.js` nổ to khi CLI nội bộ
+   đổi giao diện thay vì âm thầm fallback. Không có chỗ nào được biến đỏ thành xanh.
+6. **Không mở nội dung hội thoại của người dùng.** CSDL hội thoại Antigravity chỉ được `stat` để đo động tĩnh.
+   Muốn biết agent làm gì thì đọc `result.json` (hợp đồng) và `git diff`, không giải mã protobuf.
+   **Ngoại lệ duy nhất (chủ dự án yêu cầu 14/09/2026):** `transcriptErrors()` đọc 64 KB cuối của
+   `~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript.jsonl` (hoặc `~/.gemini/antigravity-cli/brain/<id>/…` cho hội thoại của `agy`) để đếm dòng `"type":"ERROR_MESSAGE"`
+   và lấy `created_at` — **không** trả về `content`. Lý do: "stream interrupted" là tín hiệu thật của agent chết
+   giữa chừng mà `stallMinutes` (chỉ đếm im lặng) không bắt được.
+
+## 2. Kiến trúc (một vòng dữ liệu)
+
+```
+Claude Code ──MCP stdio──▶ src/server.js ──▶ src/tools.js ─┬─▶ src/agentapi.js ──▶ agentapi (CLI) ──gRPC 127.0.0.1──▶ Antigravity IDE
+                                                            ├─▶ src/tasks.js   (máy trạng thái + cổng nghiệm thu)
+                                                            ├─▶ src/prompt.js  (hợp đồng báo cáo)
+                                                            ├─▶ src/proof.js   (ảnh nghiệm thu)
+                                                            └─▶ src/report.js  (báo cáo)
+                                        trạng thái ⇒ <project>/.antigravity-pm/tasks/<id>/
+```
+
+| File | Trách nhiệm duy nhất |
+| --- | --- |
+| `src/discover.js` | Tìm địa chỉ + khoá phiên của language server đang chạy. Chỗ duy nhất chạm vào process table. |
+| `src/projects.js` | Giải đường dẫn project → project id của Antigravity. Chỗ duy nhất đọc `~/.gemini/config/projects/`. |
+| `src/agentapi.js` | Chỗ duy nhất gọi CLI `agentapi` **và** `agy` (model cụ thể). Đổi giao diện CLI ⇒ chỉ sửa ở đây. |
+| `src/tasks.js` | Máy trạng thái + `gate()`. Không I/O mạng, không gọi agent. |
+| `src/prompt.js` | Soạn prompt. **Kế hoạch do PM viết** — agent chỉ phản biện (`buildPlanCritiquePrompt`) rồi thực thi. Mọi ràng buộc gửi cho agent nằm ở đây, không rải rác trong tools. Sáu luật bắt buộc (cấm bịa, oracle đỏ→xanh, cấm sửa test cho xanh, đếm test thật, liệt kê nơi dùng, churn guard) là phần cứng của hợp đồng — sửa phải kèm test trong `tests/prompt-rules.test.js`. |
+| `src/policy.js` | Luật bắt buộc (`mustHave`): nhận diện file test (phải do agent khai), provider ảnh hợp lệ, oracle, file rác gốc repo, chồng lấn task song song, câu nhắc cho agent. |
+| `src/evidence.js` | Bằng chứng test phía PM: XML JUnit mới hơn mốc chạy, Gradle không `executed`, lỗi bị nuốt exit code. Chỉ đọc đĩa. |
+| `src/oracle.js` | PM tự replay oracle đỏ→xanh: worktree ở `baseCommit` + file test của agent → RED, cây thật → GREEN; `finally` gỡ worktree. |
+| `src/lint-diff.js` | Soi thay đổi: nhân đôi nội dung (vá bằng script), `create table` trùng, guard bị xoá / code bọc cờ test / assert bị xoá trong test. Chỉ đọc đĩa + `git show`/`git diff`. |
+| `src/worktree.js` | Cây làm việc: `git status` (untracked=all, bỏ thư mục trạng thái), file thay đổi của task, ctx cho `gate()`, worktree đóng băng (HEAD + diff + file mới). |
+| `src/plan-review.js` | Hash `plan.md`, diff v(n−1)→v(n), tình trạng `plan-review.json` (treo / sai khuôn — tự nhắc 1 lần / hash lệch). Một trong hai chỗ trong đường đọc có tác dụng phụ, không được nổ khi Antigravity đóng. |
+| `src/auto-continue.js` | Lượt `implement` / `rework` bị hạn giờ của PM dừng trước khi có `result.json` mới: `pm_status` tự gửi **một** tin làm tiếp mỗi vòng (`task.autoContinue.round`). Chỗ thứ hai trong đường đọc có tác dụng phụ, không bao giờ ném lỗi. |
+| `src/dispatch-guard.js` | Cổng trước khi giao triển khai: chồng lấn task song song, cây chưa commit, file rác. |
+| `src/cite-check.js` | Tự kiểm trích dẫn `file:dòng` (+ `snippet`) trong báo cáo agent: `verified` / `line-off` / `not-found`… Chỉ đọc file. |
+| `src/proof.js` | Chụp/nhận ảnh, kiểm magic byte, thu nhỏ. |
+| `src/proof-target.js` | Chọn bề mặt chụp: `adb devices` trước, serial chết thì AVD / web / launch, bỏ qua denylist. |
+| `src/tools.js` | Ghép tool MCP. Không chứa logic nghiệm thu — chỉ gọi `tasks.js`. |
+| `src/config.js` | Cấu hình hai tầng (chung ở `$HOME` → project). Khoá lạ ⇒ cảnh báo, không nổ. |
+
+## 3. Quy tắc khi sửa
+
+- **Thêm tool mới**: khai trong `TOOLS` (`src/tools.js`) với JSON Schema thuần. **Không thêm zod** — server cố ý
+  không phụ thuộc zod để không vỡ khi SDK đổi version.
+- **Sửa `gate()`**: phải kèm test trong [`tests/gate.test.js`](tests/gate.test.js) (hoặc `tests/bai-hoc-14-09.test.js`)
+  chứng minh trường hợp mới **bị chặn**, không chỉ test trường hợp qua được — rồi **gỡ tạm điều kiện đó** (sao chép
+  file ra ngoài, không dùng git để hoàn tác) chạy lại để chắc test đỏ đúng chỗ.
+- **Cấm agent phá cây làm việc là luật vô điều kiện** trong `guardrails()` (`git checkout/restore/stash/clean/reset`),
+  không được đưa vào trong `if commitPolicy`. Lý do: 12–13/09/2026 hai lần agent xoá việc chưa commit của task khác.
+- **Test không được cần Antigravity, không được cần mạng, không được cần thiết bị.** Toàn bộ test chạy offline (`npm test` in số hiện tại).
+  Đường đi có gọi `agentapi` thì kiểm chứng bằng `pm_doctor ping=true` trên máy thật, không mock giả rồi tự tin.
+- **Tiếng Việt không dấu trong code/prompt** (chuỗi gửi cho agent và log), **tiếng Việt có dấu trong tài liệu**.
+  Lý do: prompt đi qua nhiều tầng CLI/gRPC, tránh rủi ro mã hoá; tài liệu thì người đọc.
+- **Không tự tiện đổi hợp đồng `result.json`.** Đổi là làm hỏng mọi task đang chạy dở ở các project khác.
+  Muốn đổi thì thêm trường mới, đọc cả dạng cũ.
+
+## 4. Kiểm tra trước khi giao
+
+```bash
+npm test          # phai xanh het (offline)
+npm run lint      # cú pháp mọi file
+npm run doctor -- <project>   # đường dây thật (cần Antigravity đang mở)
+```
+
+## 5. Ràng buộc bên ngoài (không sửa được từ repo này)
+
+- Chọn model: `agentapi new-conversation --model=` chỉ nhận `flash_lite|flash|pro` và server tự quyết model (14/10/2026: cả `pro` lẫn `flash` ra `gemini-3.8-flash-tiered`; tên model cụ thể bị từ chối `no available models found for tier`). Model cụ thể chỉ chọn được bằng CLI `agy --model` (`src/agentapi.js`): hội thoại của `agy` nằm ở `~/.gemini/antigravity-cli` (IDE không thấy), lượt chạy sống cùng tiến trình `agy` (thoát là dừng; resume không có `--model` thì chạy model mặc định), headless từ chối lệnh shell nếu thiếu allow rule nên PM chạy `--dangerously-skip-permissions` (cùng mức với `autoExecutionPolicy` EAGER/TURBO của IDE). Đo trên máy thật 14/10/2026.
+- Giới hạn đã chấp nhận của đường `agy` (review 14/10/2026): lời nhắc đi qua argv nên người dùng khác trên cùng máy đọc được qua `ps` suốt cả luot (đường `agentapi` vốn cũng vậy, chỉ ngắn hơn); `agy --print <giá trị>` nhận nguyên giá trị bắt đầu bằng `-` (Go `flag`, đọc từ chuỗi trong binary, chưa chạy thật); hai tiến trình PM trên cùng HOME dùng chung khóa file `agy-conversations.json.lock` (mồ côi > 40 giây là cũ, `LOCK_STALE_MS`); PM bị SIGKILL giữa lúc chờ `init` của `newConversation` (SIGTERM thì tự dọn) để lại agy chạy tiếp: `newConversation` ghi ngay sau spawn một mục `pending-<pid agy>` kèm dấu vân tay ps của agy và của PM chủ, và PM kế tiếp mở hội thoại agy mới sẽ dừng nhóm agy đó khi PM chủ không còn (ps hỏng thì giữ mục, không dừng gì); agy mồ côi chỉ bị dọn khi có lần mở hội thoại agy kế tiếp (một phiên chỉ gọi `sendMessage` không dọn), chưa có lần nào thì còn chạy. Cửa sổ còn lại từ spawn đến lúc ghi bản ghi chờ (một lần `ps` của agy cộng khoá) thường cỡ vài chục mili giây, xấu nhất 7 giây (trần timeout `ps` của `procTag`, mặc định 5 giây, `ANTIGRAVITY_PM_PS_TIMEOUT_MS`) cộng 3 giây chờ khoá: PM chết trong đó thì agy không để lại dấu vết. Con cháu của một agy đã thoát trước khi dọn không bị dừng, và mục chờ có pid vượt giới hạn hệ điều hành (sửa tay) được giữ mãi. Đọc sổ để CHỌN ĐƯỜNG chịu lỗi (sổ hỏng không kéo sập đường IDE), còn ghi / đặt chỗ / mở luot mới thì nổ to.
+- Lệnh của agent sống sót sau lượt `agy` (#697, 30/10/2026: `python3 -c 'while True: pass'` mồ côi đốt một lõi 18 phút): agy đặt `ANTIGRAVITY_AGENT=1` cho lệnh nó chạy (chuỗi có trong binary) và chuyển env của nó xuống, nên PM spawn agy kèm thẻ lượt `ANTIGRAVITY_PM_RUN=<tên file agy-runs>` (mục sổ giữ ở `out`, ghi cùng lần với pid agy và PM chủ). `reapTurnLeftovers()` chạy khi mở hội thoại / gửi tin agy, trong `pm_status`, và mỗi 60 giây trong server (`startLeftoverReaper`: agent ghi file kết quả trước khi agy thoát, PM có thể không gọi tool nào nữa). Nó chỉ dừng (SIGKILL đúng PID) tiến trình PPID 1 có cả hai biến ở PHẦN ENV (cột `command` của `ps -E` nối argv + env bằng dấu cách: cắt tiền tố argv lấy từ `ps -ww` không `-E`, vì argv như prompt của agy có thể trích nguyên chuỗi), thuộc lượt đã xong (agy không còn, theo dấu vân tay) do chính PM đó hoặc PM đã chết mở (mục thiếu chủ thì giữ), lstart chưa đổi, không phải daemon / app dùng chung (neo theo tên file thực thi: `java … GradleDaemon/KotlinCompileDaemon`, kể cả java dưới `<tên>.app/Contents/` như JBR của `Android Studio.app`, `adb … fork-server`, emulator, qemu-system-*, netsimd, crashpad_handler, watchman, daemon `--cbm-daemon-internal` của codebase-memory, file chính `*.app/Contents/MacOS/<tên>` của app GUI trừ Python vì `python3` của Homebrew chạy dưới tên `Python.app/Contents/MacOS/Python`); chỉ in tên file thực thi (argv có thể chứa token). Sổ chưa có lượt nào mang thẻ thì không gọi `ps`. Còn sót: lệnh tự đổi env hoặc tự đổi tiêu đề tiến trình (`npm`, `process.title` làm `ps -E` mất env); thẻ của lượt bị lượt mới ghi đè trong sổ khi lượt cũ do PM khác còn sống mở; mục bị bỏ khỏi sổ (> 500) hoặc mục chờ bị gỡ (agy chết trước `init`); lệnh do PM bản cũ (chưa gắn thẻ) sinh ra. Đọc env bằng `ps -axwwE` (macOS) hoặc `ps axwwe` (procps trên Linux).
+- `agentapi` chỉ có 3 lệnh: `new-conversation`, `send-message`, `get-conversation-metadata`. **Không có** lệnh
+  liệt kê hội thoại và **không có** trạng thái "đang chạy / đã xong". Mọi thiết kế ở đây là hệ quả của hai giới hạn đó.
+- `new-conversation` **bắt buộc** có project id (`ANTIGRAVITY_PROJECT_ID`), nếu không server trả
+  `project_id is required when providing project_env_config`. Id lấy từ sổ đăng ký
+  `~/.gemini/config/projects/<uuid>.json` (`src/projects.js`) — đo được trên máy thật 12/09/2026.
+  `pm_dispatch` vẫn kiểm lại workspace của hội thoại sau khi tạo, coi như lưới an toàn.
+- `send-message` **đánh thức được hội thoại đang im** — đo trên máy thật 12/09/2026: hội thoại im 11 phút,
+  động tĩnh trở lại sau ~1,6 giây. Vẫn giữ đo động tĩnh trong `pm_status` vì agent có thể dừng chờ bấm Accept
+  khi project không đặt `EAGER`/`TURBO`.
